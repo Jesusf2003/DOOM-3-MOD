@@ -1,0 +1,8 @@
+{
+  "cmake.configureOnOpen": true,
+  "cmake.configureSettings": {
+    "BASE_OUTPUT_DIR": "${workspaceFolder}/bin/base",
+    "D3XP_OUTPUT_DIR": "${workspaceFolder}/bin/base"
+  },
+  "cmake.buildTarget": "base"
+}

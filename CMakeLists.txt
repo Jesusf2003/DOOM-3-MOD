@@ -4,10 +4,12 @@ project(dhewm3sdk)
 option(BASE		"Build the base (game/) game code" ON)
 set(BASE_NAME	"base" CACHE STRING "Name of the mod built from game/ (will result in \${BASE_NAME}.dll)")
 set(BASE_DEFS	"GAME_DLL" CACHE STRING "Compiler definitions for the mod built from game/")
+set(BASE_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/base" CACHE PATH "Directory for the base game module")
 
 option(D3XP		"Build the d3xp/ game code" ON)
 set(D3XP_NAME	"d3xp" CACHE STRING "Name of the mod built from d3xp/ (will result in \${D3XP_NAME}.dll)")
 set(D3XP_DEFS	"GAME_DLL;_D3XP;CTF" CACHE STRING "Compiler definitions for the mod built from d3xp/")
+set(D3XP_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/base" CACHE PATH "Directory for the d3xp game module")
 
 option(ONATIVE	"Optimize for the host CPU" OFF)
 
@@ -233,7 +235,11 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
 		add_compile_options(-fvisibility=hidden)
 	endif()
 
-	add_compile_options(-Werror=format)
+	if(MINGW)
+		add_compile_options(-Wno-error=format)
+	else()
+		add_compile_options(-Werror=format)
+	endif()
 
 	# TODO fix these warnings
 	add_compile_options(-Wno-sign-compare)
@@ -631,6 +637,18 @@ if(BASE)
 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_game})
 
 	set_target_properties(base PROPERTIES PREFIX "")
+	set_target_properties(base PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${BASE_OUTPUT_DIR}"
+		LIBRARY_OUTPUT_DIRECTORY "${BASE_OUTPUT_DIR}"
+		ARCHIVE_OUTPUT_DIRECTORY "${BASE_OUTPUT_DIR}"
+	)
+	foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+		set_target_properties(base PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY_${config} "${BASE_OUTPUT_DIR}"
+			LIBRARY_OUTPUT_DIRECTORY_${config} "${BASE_OUTPUT_DIR}"
+			ARCHIVE_OUTPUT_DIRECTORY_${config} "${BASE_OUTPUT_DIR}"
+		)
+	endforeach()
 	set_target_properties(base PROPERTIES COMPILE_DEFINITIONS "${BASE_DEFS}")
 	target_include_directories(base PRIVATE "${CMAKE_SOURCE_DIR}/game")
 	set_target_properties(base PROPERTIES LINK_FLAGS "${ldflags}")
@@ -663,6 +681,18 @@ if(D3XP)
 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_d3xp})
 
 	set_target_properties(d3xp PROPERTIES PREFIX "")
+	set_target_properties(d3xp PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${D3XP_OUTPUT_DIR}"
+		LIBRARY_OUTPUT_DIRECTORY "${D3XP_OUTPUT_DIR}"
+		ARCHIVE_OUTPUT_DIRECTORY "${D3XP_OUTPUT_DIR}"
+	)
+	foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+		set_target_properties(d3xp PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY_${config} "${D3XP_OUTPUT_DIR}"
+			LIBRARY_OUTPUT_DIRECTORY_${config} "${D3XP_OUTPUT_DIR}"
+			ARCHIVE_OUTPUT_DIRECTORY_${config} "${D3XP_OUTPUT_DIR}"
+		)
+	endforeach()
 	set_target_properties(d3xp PROPERTIES COMPILE_DEFINITIONS "${D3XP_DEFS}")
 	target_include_directories(d3xp PRIVATE "${CMAKE_SOURCE_DIR}/d3xp")
 	set_target_properties(d3xp PROPERTIES LINK_FLAGS "${ldflags}")
