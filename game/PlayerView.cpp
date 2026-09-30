@@ -466,6 +466,11 @@ void idPlayerView::CalculatePlayerView( idVec3 &origin, idAngles &angles ) const
 		angles.pitch -= SLIDE_VIEW_PITCH * slideBlend;
 	}
 	angles.roll += player->GetSlideViewRoll();
+
+	// vault: eased camera height, pitch impulse and shoulder roll
+	origin -= player->GetPhysics()->GetGravityNormal() * player->GetVaultViewZOffset();
+	angles.pitch += player->GetVaultViewPitch();
+	angles.roll += player->GetVaultViewRoll();
 }
 
 /*

@@ -78,6 +78,9 @@ const int DEATH_VOLUME = 15;			// volume at death
 
 const int SAVING_THROW_TIME = 5000;		// maximum one "saving throw" every five seconds
 
+// landing: false removes all fall damage (the landing camera dip and sounds are kept)
+const bool PLAYER_FALL_DAMAGE = false;
+
 // sprint
 const float SPRINT_SPEED_SCALE = 1.5f;	// sprint speed = pm_walkspeed * SPRINT_SPEED_SCALE
 
@@ -94,6 +97,18 @@ const float SLIDE_VIEW_DIP = 2.5f;			// extra camera drop while sliding, in worl
 const float SLIDE_VIEW_PITCH = 2.0f;			// camera tilts up this many degrees while sliding
 const float SLIDE_VIEW_BLEND_RATE = 12.0f;	// exponential ease rate of the slide camera bias
 const float SLIDE_VIEW_ROLL = 3.0f;			// camera leans into the turn this many degrees when steering a slide
+
+// vault camera (pitch in id convention: positive looks down)
+const float VAULT_VIEW_LOW_PITCH = 2.5f;		// low vault: inertia kick, looks up this much right after take off
+const float VAULT_VIEW_LOW_PITCH_PEAK = 0.3f;	// low vault: fraction of the pass where that kick peaks, then eases back
+const float VAULT_VIEW_LOW_ROLL = 3.0f;		// low vault: shoulder wobble, one side then the other
+const float VAULT_VIEW_LAND_PITCH = 1.5f;		// landing on top of the obstacle: short downward nod
+const int VAULT_VIEW_LAND_MSEC = 150;			// duration of that nod
+const float VAULT_VIEW_ORIGIN_RATE = 25.0f;	// ease rate of the camera height during and right after a vault (eases in and out)
+const float VAULT_VIEW_GRAB_PITCH = 2.5f;		// ledge grab: looks down when the hands hit, back to level while pulling up
+const float VAULT_VIEW_HIGH_ROLL = 3.0f;		// ledge grab at an angle to the wall: shoulder roll
+const float VAULT_VIEW_YAW_ALIGN = 4.0f;		// ledge grab phase 1: the view turns at most this much to face the wall
+const float VAULT_VIEW_BLEND_RATE = 14.0f;	// how fast the camera settles if a vault is cut short (ledge jump, teleport)
 
 typedef enum {
 	LEAN_NONE,
@@ -443,6 +458,13 @@ public:
 	void					UpdateCrouchState( int msec );
 	float					GetSlideViewBlend( void ) const { return slideViewBlend; }
 	float					GetSlideViewRoll( void ) const { return slideViewRoll; }
+
+	bool					IsVaulting( void ) const { return physicsObj.IsVaulting(); }
+	vaultState_t			GetVaultState( void ) const { return physicsObj.GetVaultState(); }
+	void					UpdateVaultView( int msec );
+	float					GetVaultViewPitch( void ) const { return vaultViewPitch + vaultLandPitch; }
+	float					GetVaultViewZOffset( void ) const { return vaultViewZOffset; }
+	float					GetVaultViewRoll( void ) const { return vaultViewRoll; }
 	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 
 	bool					Give( const char *statname, const char *value );
@@ -579,6 +601,18 @@ private:
 	int						viewHeightChangeTime;
 	float					slideViewBlend;		// 0..1, eases the slide camera bias in and out
 	float					slideViewRoll;		// eased roll from steering during a slide
+	float					vaultViewPitch;		// eased pitch impulse of the vault
+	float					vaultViewRoll;		// eased shoulder roll of the vault
+	bool					vaultYawStarted;	// yaw alignment of the current ledge grab was set up
+	float					vaultYawTarget;		// total yaw correction for this ledge grab
+	float					vaultYawApplied;	// yaw correction applied so far
+	float					vaultLandPitch;		// landing nod after a vault
+	int						vaultLandTime;		// when the last vault ended on top of something
+	bool					vaultWasActive;		// vaulting last frame
+	bool					vaultSmoothing;		// the camera height is being eased (during and right after a vault)
+	float					vaultSmoothedEyeZ;	// eased camera height along the up axis
+	float					vaultLastEyeZ;		// eye height along the up axis last frame
+	float					vaultViewZOffset;	// eased minus real camera height, applied in idPlayerView::CalculatePlayerView
 
 	int						bobFoot;
 	float					bobFrac;

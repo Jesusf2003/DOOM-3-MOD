@@ -981,6 +981,18 @@ idPlayer::idPlayer() {
 	viewHeightChangeTime	= 0;
 	slideViewBlend			= 0.0f;
 	slideViewRoll			= 0.0f;
+	vaultViewPitch			= 0.0f;
+	vaultViewRoll			= 0.0f;
+	vaultYawStarted			= false;
+	vaultYawTarget			= 0.0f;
+	vaultYawApplied			= 0.0f;
+	vaultLandPitch			= 0.0f;
+	vaultLandTime			= 0;
+	vaultWasActive			= false;
+	vaultSmoothing			= false;
+	vaultSmoothedEyeZ		= 0.0f;
+	vaultLastEyeZ			= 0.0f;
+	vaultViewZOffset		= 0.0f;
 
 	weapon					= NULL;
 
@@ -1327,6 +1339,18 @@ void idPlayer::Init( void ) {
 	viewHeightChangeTime = 0;
 	slideViewBlend = 0.0f;
 	slideViewRoll = 0.0f;
+	vaultViewPitch = 0.0f;
+	vaultViewRoll = 0.0f;
+	vaultYawStarted = false;
+	vaultYawTarget = 0.0f;
+	vaultYawApplied = 0.0f;
+	vaultLandPitch = 0.0f;
+	vaultLandTime = 0;
+	vaultWasActive = false;
+	vaultSmoothing = false;
+	vaultSmoothedEyeZ = 0.0f;
+	vaultLastEyeZ = 0.0f;
+	vaultViewZOffset = 0.0f;
 
 	stepUpTime = 0;
 	stepUpDelta = 0.0f;
@@ -2089,6 +2113,18 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	viewHeightChangeTime = 0;
 	slideViewBlend = 0.0f;
 	slideViewRoll = 0.0f;
+	vaultViewPitch = 0.0f;
+	vaultViewRoll = 0.0f;
+	vaultYawStarted = false;
+	vaultYawTarget = 0.0f;
+	vaultYawApplied = 0.0f;
+	vaultLandPitch = 0.0f;
+	vaultLandTime = 0;
+	vaultWasActive = false;
+	vaultSmoothing = false;
+	vaultSmoothedEyeZ = 0.0f;
+	vaultLastEyeZ = 0.0f;
+	vaultViewZOffset = 0.0f;
 
 	// DG: workaround for lingering messages that are shown forever after loading a savegame
 	//     (one way to get them is saving again, while the message from first save is still
@@ -4657,6 +4693,11 @@ void idPlayer::CrashLand( const idVec3 &oldOrigin, const idVec3 &oldVelocity ) {
 		}
 	}
 
+	// fall damage is disabled for this mod
+	if ( !PLAYER_FALL_DAMAGE ) {
+		noDamage = true;
+	}
+
 	origin = GetPhysics()->GetOrigin();
 	gravityVector = physicsObj.GetGravity();
 
@@ -4765,7 +4806,7 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
 		return;
 	}
 
-	if ( !physicsObj.HasGroundContacts() || physicsObj.IsSliding() || influenceActive == INFLUENCE_LEVEL2 || ( gameLocal.isMultiplayer && spectating ) ) {
+	if ( !physicsObj.HasGroundContacts() || physicsObj.IsSliding() || physicsObj.IsVaulting() || influenceActive == INFLUENCE_LEVEL2 || ( gameLocal.isMultiplayer && spectating ) ) {
 		// airborne or sliding
 		bobCycle = 0;
 		bobFoot = 0;
@@ -5782,7 +5823,7 @@ bool idPlayer::WantsToSprint( void ) const {
 	if ( !( usercmd.buttons & BUTTON_RUN ) || usercmd.forwardmove <= 0 ) {
 		return false;
 	}
-	return physicsObj.HasGroundContacts() && !physicsObj.OnLadder() && !physicsObj.IsCrouching();
+	return physicsObj.HasGroundContacts() && !physicsObj.OnLadder() && !physicsObj.IsCrouching() && !physicsObj.IsVaulting();
 }
 
 /*
@@ -5829,7 +5870,7 @@ void idPlayer::UpdateLean( int msec ) {
 
 	buttons = usercmd.buttons & ( BUTTON_LEAN_LEFT | BUTTON_LEAN_RIGHT );
 
-	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() || IsSliding() ||
+	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() || IsSliding() || IsVaulting() ||
 		gameLocal.inCinematic || objectiveSystemOpen || influenceActive ) {
 		currentLean = LEAN_NONE;
 	} else if ( buttons == BUTTON_LEAN_LEFT ) {
@@ -5960,6 +6001,140 @@ void idPlayer::UpdateCrouchState( int msec ) {
 	slideViewRoll += ( rollTarget - slideViewRoll ) * blendFrac;
 	if ( idMath::Fabs( slideViewRoll - rollTarget ) < 0.001f ) {
 		slideViewRoll = rollTarget;
+	}
+}
+
+/*
+==============
+idPlayer::UpdateVaultView
+
+Procedural camera for vaults, computed from the phase progress so it never stops or jumps:
+  low vault:  looks up on take off, down over the edge, subtle shoulder sway, all back to 0 on landing
+  ledge grab: looks down as the hands hit (and turns a few degrees to face the wall), back to level
+              while pulling up, shoulder roll when climbing at an angle
+==============
+*/
+void idPlayer::UpdateVaultView( int msec ) {
+	const vaultState_t state = physicsObj.GetVaultState();
+	const float u = physicsObj.GetVaultProgress();
+	const float dt = MS2SEC( msec );
+
+	// camera height: during a vault and right after it the camera follows the body through an
+	// exponential ease, so the kinematic move starts and ends softly instead of snapping
+	const float eyeZ = GetEyePosition() * -physicsObj.GetGravityNormal();
+	if ( state != VAULT_NONE && !vaultSmoothing ) {
+		vaultSmoothing = true;
+		vaultSmoothedEyeZ = vaultLastEyeZ;		// start from where the camera was before this frame's move
+	}
+	if ( vaultSmoothing ) {
+		vaultSmoothedEyeZ += ( eyeZ - vaultSmoothedEyeZ ) * ( 1.0f - idMath::Exp( -VAULT_VIEW_ORIGIN_RATE * dt ) );
+		vaultViewZOffset = vaultSmoothedEyeZ - eyeZ;
+		if ( idMath::Fabs( vaultViewZOffset ) > 96.0f || ( state == VAULT_NONE && idMath::Fabs( vaultViewZOffset ) < 0.05f ) ) {
+			// settled, or teleported
+			vaultSmoothing = false;
+			vaultViewZOffset = 0.0f;
+		}
+	}
+
+	// while vaulting (or easing after), the eye can be above the top of a crouch sized box: never
+	// let the camera go into a low ceiling, keep it under whatever is above the box
+	if ( state != VAULT_NONE || vaultSmoothing ) {
+		const idVec3 up = -physicsObj.GetGravityNormal();
+		const idVec3 eye = GetEyePosition();
+		const idVec3 boxTop = physicsObj.GetOrigin() + up * ( physicsObj.GetBounds()[1][2] - 2.0f );
+		const idVec3 camera = eye + up * vaultViewZOffset;
+		if ( ( camera - boxTop ) * up > 0.0f ) {
+			trace_t tr;
+			const idBounds cameraBounds( idVec3( -4.0f, -4.0f, -4.0f ), idVec3( 4.0f, 4.0f, 4.0f ) );
+			gameLocal.clip.TraceBounds( tr, boxTop, camera, cameraBounds, MASK_SOLID, this );
+			if ( tr.fraction < 1.0f ) {
+				vaultViewZOffset = ( tr.endpos - eye ) * up;
+			}
+		}
+	}
+	vaultLastEyeZ = eyeZ;
+
+	// landing nod when a vault ends on top of the obstacle (not when it was cut short by a ledge jump)
+	if ( vaultWasActive && state == VAULT_NONE && !physicsObj.HasJumped() ) {
+		vaultLandTime = gameLocal.time;
+	}
+	vaultWasActive = ( state != VAULT_NONE );
+	if ( vaultLandTime && gameLocal.time - vaultLandTime < VAULT_VIEW_LAND_MSEC ) {
+		vaultLandPitch = VAULT_VIEW_LAND_PITCH * idMath::Sin( idMath::PI * ( gameLocal.time - vaultLandTime ) / (float)VAULT_VIEW_LAND_MSEC );
+	} else {
+		vaultLandPitch = 0.0f;
+	}
+
+	if ( state == VAULT_NONE ) {
+		// settle back to neutral, only noticeable when a vault was cut short
+		const float frac = 1.0f - idMath::Exp( -VAULT_VIEW_BLEND_RATE * dt );
+		vaultViewPitch -= vaultViewPitch * frac;
+		vaultViewRoll -= vaultViewRoll * frac;
+		if ( idMath::Fabs( vaultViewPitch ) < 0.001f ) {
+			vaultViewPitch = 0.0f;
+		}
+		if ( idMath::Fabs( vaultViewRoll ) < 0.001f ) {
+			vaultViewRoll = 0.0f;
+		}
+		vaultYawStarted = false;
+		return;
+	}
+
+	// wall to the front-right (its normal points back-left) rolls right, and the other way round
+	const float side = GetLeanRightVector() * -physicsObj.GetVaultLedgeNormal();
+	const float angledRoll = VAULT_VIEW_HIGH_ROLL * idMath::ClampFloat( -1.0f, 1.0f, side * 2.0f );
+	const float ease = u * u * ( 3.0f - 2.0f * u );
+
+	switch ( state ) {
+		case VAULT_LOW: {
+			// inertia kick: eases up to VAULT_VIEW_LOW_PITCH (looking up) shortly after take off, then eases
+			// back to level as the body settles on top; both ends have zero slope
+			float kick;
+			if ( u < VAULT_VIEW_LOW_PITCH_PEAK ) {
+				const float k = u / VAULT_VIEW_LOW_PITCH_PEAK;
+				kick = k * k * ( 3.0f - 2.0f * k );
+			} else {
+				kick = 0.5f * ( 1.0f + idMath::Cos( idMath::PI * ( u - VAULT_VIEW_LOW_PITCH_PEAK ) / ( 1.0f - VAULT_VIEW_LOW_PITCH_PEAK ) ) );
+			}
+			vaultViewPitch = -VAULT_VIEW_LOW_PITCH * kick;
+			// wobble: leads with the shoulder on the side of the approach (the right one when going straight
+			// at it), swings to the other side, zero at both ends. 0.77 is the peak of sin(2 pi u) sin(pi u)
+			const float sway = ( side < -0.05f ) ? -1.0f : 1.0f;
+			vaultViewRoll = VAULT_VIEW_LOW_ROLL * sway * idMath::Sin( idMath::TWO_PI * u ) * idMath::Sin( idMath::PI * u ) / 0.77f;
+			break;
+		}
+		case VAULT_HIGH_GRAB:
+			vaultViewPitch = VAULT_VIEW_GRAB_PITCH * ease;
+			vaultViewRoll = angledRoll * ease;
+			break;
+		case VAULT_CLIMBING:
+			vaultViewPitch = VAULT_VIEW_GRAB_PITCH * ( 1.0f - ease );
+			vaultViewRoll = angledRoll;
+			break;
+		case VAULT_MANTLE:
+			vaultViewPitch = 0.0f;
+			vaultViewRoll = angledRoll * ( 1.0f - ease );
+			break;
+		default:
+			break;
+	}
+
+	// ledge grab: turn the view a few degrees to face the wall during phase 1. This changes the real
+	// view angles (through the delta angles) so the correction stays after the vault
+	if ( state == VAULT_HIGH_GRAB || state == VAULT_CLIMBING ) {
+		if ( !vaultYawStarted ) {
+			vaultYawStarted = true;
+			const float wallYaw = ( -physicsObj.GetVaultLedgeNormal() ).ToYaw();
+			vaultYawTarget = idMath::ClampFloat( -VAULT_VIEW_YAW_ALIGN, VAULT_VIEW_YAW_ALIGN, idMath::AngleNormalize180( wallYaw - viewAngles.yaw ) );
+			vaultYawApplied = 0.0f;
+		}
+		const float wanted = ( state == VAULT_HIGH_GRAB ) ? vaultYawTarget * ease : vaultYawTarget;
+		if ( wanted != vaultYawApplied ) {
+			idAngles angles = viewAngles;
+			angles.yaw += wanted - vaultYawApplied;
+			SetViewAngles( angles );
+			vaultYawApplied = wanted;
+		}
 	}
 }
 
@@ -6203,8 +6378,9 @@ void idPlayer::Move( void ) {
 	// update our last valid AAS location for the AI
 	SetAASLocation();
 
-	// eased eye height for standing / crouching / sliding
+	// eased eye height for standing / crouching / sliding, and the vault camera
 	UpdateCrouchState( gameLocal.msec );
+	UpdateVaultView( gameLocal.msec );
 
 	if ( noclip || gameLocal.inCinematic || ( influenceActive == INFLUENCE_LEVEL2 ) ) {
 		AI_CROUCH	= false;

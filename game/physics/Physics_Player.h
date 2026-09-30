@@ -71,6 +71,14 @@ typedef struct playerPState_s {
 	int						movementTime;
 } playerPState_t;
 
+typedef enum {
+	VAULT_NONE,
+	VAULT_LOW,				// obstacle up to 38u: one continuous parabolic pass
+	VAULT_HIGH_GRAB,		// ledge grab phase 1: the hands hit the ledge, run-up speed is absorbed
+	VAULT_CLIMBING,			// ledge grab phase 2: pull up (EaseOutCubic)
+	VAULT_MANTLE			// ledge grab phase 3: over the edge, the run-up speed comes back (ease-in)
+} vaultState_t;
+
 class idPhysics_Player : public idPhysics_Actor {
 
 public:
@@ -110,6 +118,12 @@ public:
 	int						GetSlideTimer( void ) const { return slideTimer; }
 	const idVec3 &			GetSlideDir( void ) const { return slideDir; }
 	bool					CanUncrouch( void ) const;
+							// vault / ledge grab
+	vaultState_t			GetVaultState( void ) const { return currentVaultState; }
+	bool					IsVaulting( void ) const { return currentVaultState != VAULT_NONE; }
+	float					GetVaultProgress( void ) const;	// progress of the current phase
+	const idVec3 &			GetVaultLedgeNormal( void ) const { return vaultLedgeNormal; }
+	bool					CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch = NULL, float probeDist = 40.0f, float *outWallDist = NULL );
 
 public:	// common physics interface
 	bool					Evaluate( int timeStepMSec, int endTimeMSec );
@@ -187,6 +201,30 @@ private:
 	int						slideTimer;				// the slide ends at this time unless a downhill slope keeps it alive
 	int						slideCooldownTimer;		// no new slide before this time
 	bool					wasWalking;				// on the ground last frame, to detect landings
+
+	// vault / ledge grab (not saved: a vault lasts a fraction of a second)
+	vaultState_t			currentVaultState;
+	vaultState_t			vaultType;				// VAULT_LOW or VAULT_HIGH_GRAB, chosen when the vault starts
+	int						vaultInputBuffer;		// a fresh jump press can start a vault until this time
+	bool					vaultJumpDown;			// jump was down last frame
+	bool					vaultJumpPressed;		// fresh jump press this frame
+	bool					vaultLatch;				// set when a vault ends: no jump or vault until jump is released
+	int						vaultStartTime;
+	int						vaultPhaseStartTime;	// start of the current phase
+	int						vaultTimer;				// end of the current phase
+	int						vaultCooldownTimer;		// no new vault before this time
+	idVec3					vaultStartPos;
+	idVec3					vaultPhaseStartPos;		// position when the current phase started
+	idVec3					vaultTargetPos;			// end of the kinematic move
+	idVec3					vaultLedgeNormal;		// normal of the obstacle face
+	idVec3					vaultForward;			// horizontal direction of the vault
+	idVec3					vaultEntryVelocity;		// horizontal velocity when the vault started
+	float					vaultLedgeHeight;		// height of the end position above the start
+	float					vaultMoveSpeed;			// low: speed of the pass. ledge grab: speed handed back at the end
+	float					vaultAbsorbSpeed;		// ledge grab phase 1: speed towards the wall being absorbed
+	float					vaultAbsorbMax;			// ledge grab phase 1: distance left until the box touches the wall
+	bool					vaultShrunk;			// low vault: the box was shrunk to crouch height for the pass
+	bool					vaultWallContact;		// ledge grab: the box touched the wall, no more horizontal move until phase 3
 	idVec3					slideDir;				// horizontal direction locked when the slide started
 
 	// results of last evaluate
@@ -215,6 +253,11 @@ private:
 	void					UpdateJumpAssists( void );
 	void					CheckSlideStart( void );
 	void					EndSlide( void );
+	idBounds				PlayerBounds( const bool crouched ) const;
+	bool					HasHeadroom( void ) const;
+	bool					CheckVaultStart( void );
+	void					ProcessVault( int msec );
+	void					EndVault( const bool keepMomentum );
 	void					ProcessSlide( int msec );
 	void					SetClipHeight( const float maxZ );
 	bool					CheckWaterJump( void );

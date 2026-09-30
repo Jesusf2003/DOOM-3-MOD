@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sys/platform.h"
 #include "renderer/RenderSystem.h"
+#include "renderer/ModelManager.h"
 
 #include "gamesys/SysCvar.h"
 #include "Player.h"
@@ -922,6 +923,7 @@ void idMoveableItem::Spawn( void ) {
 	float density, friction, bouncyness, tsize;
 	idStr clipModelName;
 	idBounds bounds;
+	idVec3 clipMins, clipMaxs;
 
 	// create a trigger for item pickup
 	spawnArgs.GetFloat( "triggersize", "16.0", tsize );
@@ -929,16 +931,28 @@ void idMoveableItem::Spawn( void ) {
 	trigger->Link( gameLocal.clip, this, 0, GetPhysics()->GetOrigin(), GetPhysics()->GetAxis() );
 	trigger->SetContents( CONTENTS_TRIGGER );
 
-	// check if a clip model is set
-	spawnArgs.GetString( "clipmodel", "", clipModelName );
-	if ( !clipModelName[0] ) {
-		clipModelName = spawnArgs.GetString( "model" );		// use the visual model
-	}
+	if ( spawnArgs.GetVector( "clipmins", NULL, clipMins ) && spawnArgs.GetVector( "clipmaxs", NULL, clipMaxs ) ) {
+		// an explicit box always wins, no mesh involved
+		trm.SetupBox( idBounds( clipMins, clipMaxs ) );
+	} else {
+		// check if a clip model is set
+		spawnArgs.GetString( "clipmodel", "", clipModelName );
+		if ( !clipModelName[0] ) {
+			clipModelName = spawnArgs.GetString( "model" );		// use the visual model
+		}
 
-	// load the trace model
-	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
-		gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
-		return;
+		// load the trace model
+		if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
+			// too complex for a trace model (more than MAX_TRACEMODEL_VERTS vertices): fall back to its
+			// bounding box instead of taking the whole map down
+			idRenderModel *renderModel = renderModelManager->FindModel( clipModelName );
+			if ( renderModel == NULL || renderModel->Bounds().IsCleared() ) {
+				gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
+				return;
+			}
+			gameLocal.Warning( "idMoveableItem '%s': %s is too complex for a collision model, using its bounding box (set clipmins / clipmaxs in the def)", name.c_str(), clipModelName.c_str() );
+			trm.SetupBox( renderModel->Bounds() );
+		}
 	}
 
 	// if the model should be shrinked
