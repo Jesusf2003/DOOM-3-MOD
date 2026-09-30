@@ -88,6 +88,13 @@ const float LEAN_MAX_OFFSET = 28.0f;	// lateral camera offset at full lean, in w
 const float LEAN_MAX_ROLL = 8.0f;		// head roll at full lean, in degrees
 const float LEAN_SPEED = 5.0f;			// leanAmount change per second (0.2s to fully lean)
 
+// crouch & slide camera
+const int CROUCH_VIEW_TRANSITION_MSEC = 180;	// eye height change between standing and crouching
+const float SLIDE_VIEW_DIP = 2.5f;			// extra camera drop while sliding, in world units
+const float SLIDE_VIEW_PITCH = 2.0f;			// camera tilts up this many degrees while sliding
+const float SLIDE_VIEW_BLEND_RATE = 12.0f;	// exponential ease rate of the slide camera bias
+const float SLIDE_VIEW_ROLL = 3.0f;			// camera leans into the turn this many degrees when steering a slide
+
 typedef enum {
 	LEAN_NONE,
 	LEAN_LEFT,
@@ -256,6 +263,8 @@ public:
 	leanState_t				currentLean;
 	float					leanAmount;				// -1.0f (full left) to 1.0f (full right)
 	float					leanOffset;				// current lateral camera offset after collision, in world units
+
+	float					currentViewHeight;		// eased eye height, standing pm_normalviewheight / crouched pm_crouchviewheight
 
 	idScriptBool			AI_FORWARD;
 	idScriptBool			AI_BACKWARD;
@@ -428,6 +437,12 @@ public:
 	bool					IsSprinting( void ) const;
 	void					UpdateLean( int msec );
 	bool					CheckLeanCollision( float offset );
+
+	bool					IsSliding( void ) const { return physicsObj.IsSliding(); }
+	bool					CanUncrouch( void ) const { return physicsObj.CanUncrouch(); }
+	void					UpdateCrouchState( int msec );
+	float					GetSlideViewBlend( void ) const { return slideViewBlend; }
+	float					GetSlideViewRoll( void ) const { return slideViewRoll; }
 	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 
 	bool					Give( const char *statname, const char *value );
@@ -557,6 +572,13 @@ private:
 	idPhysics_Player		physicsObj;			// player physics
 
 	idList<aasLocation_t>	aasLocation;		// for AI tracking the player
+
+	// crouch view transition (not saved, rebuilt from the eye height on restore)
+	float					viewHeightFrom;
+	float					viewHeightTarget;
+	int						viewHeightChangeTime;
+	float					slideViewBlend;		// 0..1, eases the slide camera bias in and out
+	float					slideViewRoll;		// eased roll from steering during a slide
 
 	int						bobFoot;
 	float					bobFrac;

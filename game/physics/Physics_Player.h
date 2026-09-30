@@ -104,6 +104,12 @@ public:
 	void					SetCoyoteTimer( const int time ) { coyoteTimer = time; }
 	int						GetJumpBufferTimer( void ) const { return jumpBufferTimer; }
 	void					SetJumpBufferTimer( const int time ) { jumpBufferTimer = time; }
+							// crouch & slide
+	void					SetSprinting( const bool sprinting ) { isSprinting = sprinting; }
+	bool					IsSliding( void ) const { return isSliding; }
+	int						GetSlideTimer( void ) const { return slideTimer; }
+	const idVec3 &			GetSlideDir( void ) const { return slideDir; }
+	bool					CanUncrouch( void ) const;
 
 public:	// common physics interface
 	bool					Evaluate( int timeStepMSec, int endTimeMSec );
@@ -174,6 +180,15 @@ private:
 	int						coyoteTimer;			// jumping is still allowed until this time after leaving the ground
 	int						jumpBufferTimer;		// a jump pressed in the air is remembered until this time
 
+	// crouch & slide (not saved: a slide only lasts a fraction of a second)
+	bool					isSprinting;			// fed by idPlayer every frame, slides can only start from a sprint
+	bool					crouchHeld;				// crouch was held last frame, to detect a fresh press
+	bool					isSliding;
+	int						slideTimer;				// the slide ends at this time unless a downhill slope keeps it alive
+	int						slideCooldownTimer;		// no new slide before this time
+	bool					wasWalking;				// on the ground last frame, to detect landings
+	idVec3					slideDir;				// horizontal direction locked when the slide started
+
 	// results of last evaluate
 	waterLevel_t			waterLevel;
 	int						waterType;
@@ -198,6 +213,10 @@ private:
 	void					CheckLadder( void );
 	bool					CheckJump( void );
 	void					UpdateJumpAssists( void );
+	void					CheckSlideStart( void );
+	void					EndSlide( void );
+	void					ProcessSlide( int msec );
+	void					SetClipHeight( const float maxZ );
 	bool					CheckWaterJump( void );
 	void					SetWaterLevel( void );
 	void					DropTimers( void );

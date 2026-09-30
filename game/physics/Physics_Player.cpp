@@ -60,6 +60,20 @@ const int PM_COYOTE_MSEC		= 150;		// grace time to jump after walking off a ledg
 const int PM_JUMPBUFFER_MSEC	= 150;		// a jump pressed this long before landing still fires
 const float PM_FALL_GRAVITY_SCALE	= 1.8f;	// gravity multiplier while falling, removes the floaty jump
 
+// slide
+const int PM_SLIDE_DURATION_MSEC	= 600;		// slide length on flat ground
+const float PM_SLIDE_SPEED_SCALE	= 1.25f;	// initial slide speed = sprint speed * this
+const float PM_SLIDE_FRICTION		= 1.0f;		// fraction of speed lost per second, much lower than PM_FRICTION
+const float PM_SLIDE_STEER_SPEED	= 60.0f;	// max sideways speed from strafe keys while sliding
+const float PM_SLIDE_TURN_RATE		= 30.0f;	// degrees per second slideDir can follow the view
+const float PM_SLIDE_SLOPE_SCALE	= 1.0f;		// how much of the gravity along a ramp accelerates the slide
+const float PM_SLIDE_MIN_SLOPE_ACCEL	= 100.0f;	// downhill acceleration (u/s^2, ~5 degrees) that keeps the slide going
+const int PM_SLIDE_SLOPE_GRACE_MSEC	= 100;		// slide keeps going this long after leaving a steep enough ramp
+const float PM_SLIDE_MAX_SPEED		= 600.0f;	// cap for long ramps
+const float PM_SLIDE_MIN_SPEED_FRAC	= 0.85f;	// must already move at this fraction of sprint speed to slide
+const int PM_SLIDE_COOLDOWN_MSEC	= 500;		// time after a slide ends before another one can start
+const float PM_SLIDE_LAND_SPEED_SCALE	= 1.3f;	// landing with crouch held slides if faster than pm_walkspeed * this
+
 // movementFlags
 const int PMF_DUCKED			= 1;		// set when ducking
 const int PMF_JUMPED			= 2;		// set when the player jumped this frame
@@ -1080,27 +1094,19 @@ Sets clip model size
 ==============
 */
 void idPhysics_Player::CheckDuck( void ) {
-	trace_t	trace;
-	idVec3 end;
-	idBounds bounds;
 	float maxZ;
 
 	if ( current.movementType == PM_DEAD ) {
 		maxZ = pm_deadheight.GetFloat();
 	} else {
-		// stand up when up against a ladder
-		if ( command.upmove < 0 && !ladder ) {
+		// stand up when up against a ladder, a slide keeps us down even if crouch is released
+		if ( ( command.upmove < 0 || isSliding ) && !ladder ) {
 			// duck
 			current.movementFlags |= PMF_DUCKED;
 		} else {
-			// stand up if possible
-			if ( current.movementFlags & PMF_DUCKED ) {
-				// try to stand up
-				end = current.origin - ( pm_normalheight.GetFloat() - pm_crouchheight.GetFloat() ) * gravityNormal;
-				gameLocal.clip.Translation( trace, current.origin, end, clipModel, clipModel->GetAxis(), clipMask, self );
-				if ( trace.fraction >= 1.0f ) {
-					current.movementFlags &= ~PMF_DUCKED;
-				}
+			// stand up only if there is room above our head, otherwise stay crouched
+			if ( ( current.movementFlags & PMF_DUCKED ) && CanUncrouch() ) {
+				current.movementFlags &= ~PMF_DUCKED;
 			}
 		}
 
@@ -1111,6 +1117,17 @@ void idPhysics_Player::CheckDuck( void ) {
 			maxZ = pm_normalheight.GetFloat();
 		}
 	}
+	idPhysics_Player::SetClipHeight( maxZ );
+}
+
+/*
+================
+idPhysics_Player::SetClipHeight
+================
+*/
+void idPhysics_Player::SetClipHeight( const float maxZ ) {
+	idBounds bounds;
+
 	// if the clipModel height should change
 	if ( clipModel->GetBounds()[1][2] != maxZ ) {
 
@@ -1122,6 +1139,178 @@ void idPhysics_Player::CheckDuck( void ) {
 			clipModel->LoadModel( idTraceModel( bounds ) );
 		}
 	}
+}
+
+/*
+================
+idPhysics_Player::CanUncrouch
+
+Sweeps the crouched box up by the height difference to the standing box.
+Anything in the way (low ceiling, vent, table) keeps the player crouched.
+================
+*/
+bool idPhysics_Player::CanUncrouch( void ) const {
+	trace_t	trace;
+	idVec3	end;
+
+	if ( !( current.movementFlags & PMF_DUCKED ) ) {
+		return true;
+	}
+
+	end = current.origin - ( pm_normalheight.GetFloat() - pm_crouchheight.GetFloat() ) * gravityNormal;
+	gameLocal.clip.Translation( trace, current.origin, end, clipModel, clipModel->GetAxis(), clipMask, self );
+
+	return ( trace.fraction >= 1.0f );
+}
+
+/*
+================
+idPhysics_Player::CheckSlideStart
+
+A fresh crouch press while sprinting on the ground starts a slide.
+================
+*/
+void idPhysics_Player::CheckSlideStart( void ) {
+	idVec3	flatVelocity;
+	float	flatSpeed;
+	float	speed;
+	bool	crouchPressed;
+	bool	landed;
+
+	crouchPressed = ( command.upmove < 0 ) && !crouchHeld;
+	crouchHeld = ( command.upmove < 0 );
+	landed = walking && !wasWalking;
+	wasWalking = walking;
+
+	if ( isSliding || !walking || ladder || gameLocal.time < slideCooldownTimer ) {
+		return;
+	}
+	if ( current.movementType != PM_NORMAL || waterLevel > WATERLEVEL_FEET ) {
+		return;
+	}
+
+	flatVelocity = current.velocity - ( current.velocity * gravityNormal ) * gravityNormal;
+	flatSpeed = flatVelocity.Length();
+
+	if ( crouchPressed && isSprinting && !( current.movementFlags & PMF_DUCKED ) &&
+			flatSpeed >= walkSpeed * PM_SLIDE_MIN_SPEED_FRAC ) {
+		// sprint slide: lock the horizontal view direction and give a burst of speed.
+		// walkSpeed holds the current sprint speed set by idPlayer::AdjustSpeed
+		slideDir = viewForward - ( viewForward * gravityNormal ) * gravityNormal;
+		if ( slideDir.Normalize() < 0.001f ) {
+			return;
+		}
+		speed = Max( flatSpeed, walkSpeed * PM_SLIDE_SPEED_SCALE );
+	} else if ( landed && command.upmove < 0 && flatSpeed >= pm_walkspeed.GetFloat() * PM_SLIDE_LAND_SPEED_SCALE ) {
+		// landing slide: crouch held while touching down fast turns the fall into a slide.
+		// no burst, it just keeps the momentum in the direction we were already moving
+		slideDir = flatVelocity / flatSpeed;
+		speed = flatSpeed;
+	} else {
+		return;
+	}
+
+	isSliding = true;
+	slideTimer = gameLocal.time + PM_SLIDE_DURATION_MSEC;
+	current.velocity = slideDir * speed + ( current.velocity * gravityNormal ) * gravityNormal;
+}
+
+/*
+================
+idPhysics_Player::EndSlide
+================
+*/
+void idPhysics_Player::EndSlide( void ) {
+	if ( isSliding ) {
+		isSliding = false;
+		slideCooldownTimer = gameLocal.time + PM_SLIDE_COOLDOWN_MSEC;
+	}
+}
+
+/*
+================
+idPhysics_Player::ProcessSlide
+
+Ground movement while sliding: low friction, mostly locked direction, ramps accelerate.
+================
+*/
+void idPhysics_Player::ProcessSlide( int msec ) {
+	idVec3	flatView, slideRight, slopeGravity, oldVelocity;
+	float	speed, slopeAccel, oldVel, newVel;
+	float	dt = MS2SEC( msec );
+
+	// jump cancels the slide, CheckJump keeps the horizontal velocity so the momentum carries into the jump
+	if ( ( ( command.upmove >= 10 && !( current.movementFlags & PMF_JUMP_HELD ) ) || jumpBufferTimer > gameLocal.time ) && CanUncrouch() ) {
+		idPhysics_Player::EndSlide();
+		current.movementFlags &= ~PMF_DUCKED;
+		idPhysics_Player::SetClipHeight( pm_normalheight.GetFloat() );
+		if ( idPhysics_Player::CheckJump() ) {
+			idPhysics_Player::AirMove();
+			return;
+		}
+	}
+
+	// speed along the locked direction, sideways speed from steering is not carried over
+	speed = ( current.velocity - ( current.velocity * gravityNormal ) * gravityNormal ) * slideDir;
+	if ( speed < 0.0f ) {
+		speed = 0.0f;
+	}
+
+	// low friction
+	speed -= speed * PM_SLIDE_FRICTION * dt;
+
+	// gravity along the ground plane: speeds up downhill, slows down uphill
+	slopeGravity = gravityVector - ( gravityVector * groundTrace.c.normal ) * groundTrace.c.normal;
+	slopeAccel = slopeGravity * slideDir;
+	speed += slopeAccel * PM_SLIDE_SLOPE_SCALE * dt;
+	speed = idMath::ClampFloat( 0.0f, PM_SLIDE_MAX_SPEED, speed );
+
+	// a steep enough ramp keeps the slide alive indefinitely
+	if ( slopeAccel > PM_SLIDE_MIN_SLOPE_ACCEL ) {
+		slideTimer = Max( slideTimer, gameLocal.time + PM_SLIDE_SLOPE_GRACE_MSEC );
+	}
+
+	// let slideDir slowly follow the camera
+	flatView = viewForward - ( viewForward * gravityNormal ) * gravityNormal;
+	if ( flatView.Normalize() > 0.001f ) {
+		float cosAngle = idMath::ClampFloat( -1.0f, 1.0f, slideDir * flatView );
+		float angle = RAD2DEG( idMath::ACos( cosAngle ) );
+		float maxTurn = PM_SLIDE_TURN_RATE * dt;
+		if ( angle > 0.01f ) {
+			float turn = Min( angle, maxTurn );
+			// rotate around the up axis towards the view
+			float sign = ( ( slideDir.Cross( flatView ) ) * -gravityNormal ) >= 0.0f ? 1.0f : -1.0f;
+			idRotation rotation( vec3_origin, -gravityNormal, sign * turn );
+			slideDir *= rotation;
+			slideDir.Normalize();
+		}
+	}
+
+	// end of slide: time is up or we slowed down to walking speed, keep moving this frame
+	if ( gameLocal.time >= slideTimer || speed < pm_walkspeed.GetFloat() ) {
+		idPhysics_Player::EndSlide();
+	}
+
+	// a little sideways control from the strafe keys
+	slideRight = gravityNormal.Cross( slideDir );
+	current.velocity = slideDir * speed + slideRight * ( PM_SLIDE_STEER_SPEED * command.rightmove / 127.0f );
+
+	// follow the ground plane without losing speed on slopes
+	oldVelocity = current.velocity;
+	current.velocity.ProjectOntoPlane( groundTrace.c.normal, OVERCLIP );
+	newVel = current.velocity.LengthSqr();
+	oldVel = oldVelocity.LengthSqr();
+	if ( newVel > 1.0f && oldVel > 1.0f ) {
+		current.velocity *= idMath::Sqrt( oldVel / newVel );
+	}
+
+	if ( !current.velocity.LengthSqr() ) {
+		return;
+	}
+
+	gameLocal.push.InitSavingPushedEntityPositions();
+
+	idPhysics_Player::SlideMove( false, true, true, true );
 }
 
 /*
@@ -1431,6 +1620,12 @@ void idPhysics_Player::MovePlayer( int msec ) {
 	// check if up against a ladder
 	idPhysics_Player::CheckLadder();
 
+	// slides only live on regular ground
+	if ( isSliding && ( !walking || ladder || waterLevel > WATERLEVEL_FEET || current.movementType == PM_DEAD ) ) {
+		idPhysics_Player::EndSlide();
+	}
+	idPhysics_Player::CheckSlideStart();
+
 	// set clip model size
 	idPhysics_Player::CheckDuck();
 
@@ -1463,8 +1658,13 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		idPhysics_Player::WaterMove();
 	}
 	else if ( walking ) {
-		// walking on ground
-		idPhysics_Player::WalkMove();
+		if ( isSliding ) {
+			// sliding on ground
+			idPhysics_Player::ProcessSlide( msec );
+		} else {
+			// walking on ground
+			idPhysics_Player::WalkMove();
+		}
 	}
 	else {
 		// airborne, may still jump during coyote time
@@ -1574,6 +1774,13 @@ idPhysics_Player::idPhysics_Player( void ) {
 	ladderNormal.Zero();
 	coyoteTimer = 0;
 	jumpBufferTimer = 0;
+	isSprinting = false;
+	crouchHeld = false;
+	isSliding = false;
+	slideTimer = 0;
+	slideCooldownTimer = 0;
+	wasWalking = false;
+	slideDir.Zero();
 	waterLevel = WATERLEVEL_NONE;
 	waterType = 0;
 }

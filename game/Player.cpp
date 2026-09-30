@@ -975,6 +975,13 @@ idPlayer::idPlayer() {
 	leanAmount				= 0.0f;
 	leanOffset				= 0.0f;
 
+	currentViewHeight		= 0.0f;
+	viewHeightFrom			= 0.0f;
+	viewHeightTarget		= 0.0f;
+	viewHeightChangeTime	= 0;
+	slideViewBlend			= 0.0f;
+	slideViewRoll			= 0.0f;
+
 	weapon					= NULL;
 
 	hud						= NULL;
@@ -1316,6 +1323,10 @@ void idPlayer::Init( void ) {
 
 	// start out standing
 	SetEyeHeight( pm_normalviewheight.GetFloat() );
+	currentViewHeight = viewHeightFrom = viewHeightTarget = pm_normalviewheight.GetFloat();
+	viewHeightChangeTime = 0;
+	slideViewBlend = 0.0f;
+	slideViewRoll = 0.0f;
 
 	stepUpTime = 0;
 	stepUpDelta = 0.0f;
@@ -2072,6 +2083,12 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 
 	// create combat collision hull for exact collision detection
 	SetCombatModel();
+
+	// crouch view transition is not saved, continue from the saved eye height
+	currentViewHeight = viewHeightFrom = viewHeightTarget = EyeHeight();
+	viewHeightChangeTime = 0;
+	slideViewBlend = 0.0f;
+	slideViewRoll = 0.0f;
 
 	// DG: workaround for lingering messages that are shown forever after loading a savegame
 	//     (one way to get them is saving again, while the message from first save is still
@@ -4748,8 +4765,8 @@ void idPlayer::BobCycle( const idVec3 &pushVelocity ) {
 		return;
 	}
 
-	if ( !physicsObj.HasGroundContacts() || influenceActive == INFLUENCE_LEVEL2 || ( gameLocal.isMultiplayer && spectating ) ) {
-		// airborne
+	if ( !physicsObj.HasGroundContacts() || physicsObj.IsSliding() || influenceActive == INFLUENCE_LEVEL2 || ( gameLocal.isMultiplayer && spectating ) ) {
+		// airborne or sliding
 		bobCycle = 0;
 		bobFoot = 0;
 		bobfracsin = 0;
@@ -5760,7 +5777,9 @@ bool idPlayer::WantsToSprint( void ) const {
 	if ( spectating || noclip || health <= 0 ) {
 		return false;
 	}
-	if ( !( usercmd.buttons & BUTTON_RUN ) || usercmd.forwardmove <= 0 || usercmd.upmove < 0 ) {
+	// crouch is not checked on the input (upmove < 0), only once the physics actually ducked:
+	// the frame crouch is pressed still counts as sprinting so the physics can start a slide
+	if ( !( usercmd.buttons & BUTTON_RUN ) || usercmd.forwardmove <= 0 ) {
 		return false;
 	}
 	return physicsObj.HasGroundContacts() && !physicsObj.OnLadder() && !physicsObj.IsCrouching();
@@ -5810,7 +5829,7 @@ void idPlayer::UpdateLean( int msec ) {
 
 	buttons = usercmd.buttons & ( BUTTON_LEAN_LEFT | BUTTON_LEAN_RIGHT );
 
-	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() ||
+	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() || IsSliding() ||
 		gameLocal.inCinematic || objectiveSystemOpen || influenceActive ) {
 		currentLean = LEAN_NONE;
 	} else if ( buttons == BUTTON_LEAN_LEFT ) {
@@ -5884,6 +5903,64 @@ bool idPlayer::CheckLeanCollision( float offset ) {
 	leanOffset = offset * tr.fraction;
 
 	return ( tr.fraction < 1.0f );
+}
+
+/*
+==============
+idPlayer::UpdateCrouchState
+
+Eases the eye height between standing and crouching with a smoothstep curve over
+CROUCH_VIEW_TRANSITION_MSEC instead of snapping, and blends the slide camera bias.
+==============
+*/
+void idPlayer::UpdateCrouchState( int msec ) {
+	float target;
+	float frac;
+
+	if ( spectating ) {
+		target = 0.0f;
+	} else if ( health <= 0 ) {
+		target = pm_deadviewheight.GetFloat();
+	} else if ( physicsObj.IsCrouching() ) {
+		target = pm_crouchviewheight.GetFloat();
+	} else if ( GetBindMaster() && GetBindMaster()->IsType( idAFEntity_Vehicle::Type ) ) {
+		target = 0.0f;
+	} else {
+		target = pm_normalviewheight.GetFloat();
+	}
+
+	if ( spectating ) {
+		// no transition when flying around
+		currentViewHeight = viewHeightFrom = viewHeightTarget = target;
+		viewHeightChangeTime = gameLocal.time;
+	} else {
+		if ( target != viewHeightTarget ) {
+			// restart the curve from wherever the camera is now, so reversing mid-way stays smooth
+			viewHeightFrom = currentViewHeight;
+			viewHeightTarget = target;
+			viewHeightChangeTime = gameLocal.time;
+		}
+		frac = idMath::ClampFloat( 0.0f, 1.0f, ( gameLocal.time - viewHeightChangeTime ) / (float)CROUCH_VIEW_TRANSITION_MSEC );
+		frac = frac * frac * ( 3.0f - 2.0f * frac );
+		currentViewHeight = viewHeightFrom + ( viewHeightTarget - viewHeightFrom ) * frac;
+	}
+
+	SetEyeHeight( currentViewHeight );
+
+	// slide camera bias (dip + tilt), applied in idPlayerView::CalculatePlayerView
+	const float blendFrac = 1.0f - idMath::Exp( -SLIDE_VIEW_BLEND_RATE * MS2SEC( msec ) );
+	const float blendTarget = IsSliding() ? 1.0f : 0.0f;
+	slideViewBlend += ( blendTarget - slideViewBlend ) * blendFrac;
+	if ( idMath::Fabs( slideViewBlend - blendTarget ) < 0.001f ) {
+		slideViewBlend = blendTarget;
+	}
+
+	// lean into the turn when steering the slide with the strafe keys
+	const float rollTarget = IsSliding() ? SLIDE_VIEW_ROLL * ( usercmd.rightmove / 127.0f ) : 0.0f;
+	slideViewRoll += ( rollTarget - slideViewRoll ) * blendFrac;
+	if ( idMath::Fabs( slideViewRoll - rollTarget ) < 0.001f ) {
+		slideViewRoll = rollTarget;
+	}
 }
 
 /*
@@ -6077,7 +6154,6 @@ idPlayer::Move
 ==============
 */
 void idPlayer::Move( void ) {
-	float newEyeOffset;
 	idVec3 oldOrigin;
 	idVec3 oldVelocity;
 	idVec3 pushVelocity;
@@ -6118,6 +6194,7 @@ void idPlayer::Move( void ) {
 
 	physicsObj.SetDebugLevel( g_debugMove.GetBool() );
 	physicsObj.SetPlayerInput( usercmd, viewAngles );
+	physicsObj.SetSprinting( IsSprinting() );
 
 	// FIXME: physics gets disabled somehow
 	BecomeActive( TH_PHYSICS );
@@ -6126,26 +6203,8 @@ void idPlayer::Move( void ) {
 	// update our last valid AAS location for the AI
 	SetAASLocation();
 
-	if ( spectating ) {
-		newEyeOffset = 0.0f;
-	} else if ( health <= 0 ) {
-		newEyeOffset = pm_deadviewheight.GetFloat();
-	} else if ( physicsObj.IsCrouching() ) {
-		newEyeOffset = pm_crouchviewheight.GetFloat();
-	} else if ( GetBindMaster() && GetBindMaster()->IsType( idAFEntity_Vehicle::Type ) ) {
-		newEyeOffset = 0.0f;
-	} else {
-		newEyeOffset = pm_normalviewheight.GetFloat();
-	}
-
-	if ( EyeHeight() != newEyeOffset ) {
-		if ( spectating ) {
-			SetEyeHeight( newEyeOffset );
-		} else {
-			// smooth out duck height changes
-			SetEyeHeight( EyeHeight() * pm_crouchrate.GetFloat() + newEyeOffset * ( 1.0f - pm_crouchrate.GetFloat() ) );
-		}
-	}
+	// eased eye height for standing / crouching / sliding
+	UpdateCrouchState( gameLocal.msec );
 
 	if ( noclip || gameLocal.inCinematic || ( influenceActive == INFLUENCE_LEVEL2 ) ) {
 		AI_CROUCH	= false;

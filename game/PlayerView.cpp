@@ -40,6 +40,7 @@ const int IMPULSE_DELAY = 150;
 
 const float SPRINT_FOV_BOOST = 8.0f;		// extra degrees of fov at full sprint
 const float SPRINT_FOV_RATE = 8.0f;			// exponential ease rate, higher is snappier
+const float SLIDE_FOV_BOOST = 4.0f;			// extra degrees on top of the sprint fov while sliding
 
 /*
 ==============
@@ -449,12 +450,22 @@ leanOffset is already limited by idPlayer::CheckLeanCollision, so this never ent
 ==================
 */
 void idPlayerView::CalculatePlayerView( idVec3 &origin, idAngles &angles ) const {
-	if ( player == NULL || player->leanOffset == 0.0f ) {
+	if ( player == NULL ) {
 		return;
 	}
 
-	origin += player->GetLeanRightVector() * player->leanOffset;
-	angles.roll += ( player->leanOffset / LEAN_MAX_OFFSET ) * LEAN_MAX_ROLL;
+	if ( player->leanOffset != 0.0f ) {
+		origin += player->GetLeanRightVector() * player->leanOffset;
+		angles.roll += ( player->leanOffset / LEAN_MAX_OFFSET ) * LEAN_MAX_ROLL;
+	}
+
+	// slide: drop the camera a bit more and tilt it up to sell the sudden crouch
+	const float slideBlend = player->GetSlideViewBlend();
+	if ( slideBlend > 0.0f ) {
+		origin += player->GetPhysics()->GetGravityNormal() * ( SLIDE_VIEW_DIP * slideBlend );
+		angles.pitch -= SLIDE_VIEW_PITCH * slideBlend;
+	}
+	angles.roll += player->GetSlideViewRoll();
 }
 
 /*
@@ -469,7 +480,9 @@ void idPlayerView::UpdateSprintFov( int msec ) {
 	float target = 0.0f;
 
 	if ( player != NULL && player->health > 0 ) {
-		if ( player->IsSprinting() ) {
+		if ( player->IsSliding() ) {
+			target = SPRINT_FOV_BOOST + SLIDE_FOV_BOOST;
+		} else if ( player->IsSprinting() ) {
 			target = SPRINT_FOV_BOOST;
 		} else if ( sprintFovOffset > 0.0f && !player->GetPhysics()->HasGroundContacts() ) {
 			const idVec3 &gravityNormal = player->GetPhysics()->GetGravityNormal();
