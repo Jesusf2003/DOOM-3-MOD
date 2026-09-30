@@ -74,6 +74,12 @@ public:
 
 	idAngles			AngleOffset( void ) const;			// returns the current kick angle
 
+						// procedural first person camera (lean offset + head roll)
+	void				CalculatePlayerView( idVec3 &origin, idAngles &angles ) const;
+						// sprint fov, updated once per game frame
+	void				UpdateSprintFov( int msec );
+	float				GetSprintFovOffset( void ) const { return sprintFovOffset; }
+
 	idMat3				ShakeAxis( void ) const;			// returns the current shake angle
 
 	void				CalculateShake( void );
@@ -126,6 +132,8 @@ private:
 	int					fadeTime;			// fade time
 
 	idAngles			shakeAng;			// from the sound sources
+
+	float				sprintFovOffset;	// extra fov from sprinting, eased towards SPRINT_FOV_BOOST (not saved)
 
 	idPlayer *			player;
 	renderView_t		view;

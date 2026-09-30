@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "msvc-x86",
+      "displayName": "MSVC 2022 x86 (matches bin/doom3.exe)",
+      "description": "bin/doom3.exe is a 32-bit MSVC build of dhewm3 1.5.5, so the game DLL must be MSVC Win32 too. The DLL goes next to the exe, which is where dhewm3 loads it from.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/build-x86",
+      "cacheVariables": {
+        "BASE": "ON",
+        "D3XP": "OFF",
+        "BASE_OUTPUT_DIR": "${sourceDir}/bin",
+        "D3XP_OUTPUT_DIR": "${sourceDir}/bin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "displayName": "Release",
+      "configurePreset": "msvc-x86",
+      "configuration": "Release",
+      "targets": [ "base" ]
+    },
+    {
+      "name": "debug",
+      "displayName": "RelWithDebInfo (debuggable)",
+      "configurePreset": "msvc-x86",
+      "configuration": "RelWithDebInfo",
+      "targets": [ "base" ]
+    }
+  ]
+}

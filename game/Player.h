@@ -78,6 +78,22 @@ const int DEATH_VOLUME = 15;			// volume at death
 
 const int SAVING_THROW_TIME = 5000;		// maximum one "saving throw" every five seconds
 
+// sprint
+const float SPRINT_SPEED_SCALE = 1.5f;	// sprint speed = pm_walkspeed * SPRINT_SPEED_SCALE
+
+// lean, bound with "bind q _button5" / "bind e _button6" (no engine changes needed)
+const int BUTTON_LEAN_LEFT = BUTTON_5;
+const int BUTTON_LEAN_RIGHT = BUTTON_6;
+const float LEAN_MAX_OFFSET = 28.0f;	// lateral camera offset at full lean, in world units
+const float LEAN_MAX_ROLL = 8.0f;		// head roll at full lean, in degrees
+const float LEAN_SPEED = 5.0f;			// leanAmount change per second (0.2s to fully lean)
+
+typedef enum {
+	LEAN_NONE,
+	LEAN_LEFT,
+	LEAN_RIGHT
+} leanState_t;
+
 extern const int ASYNC_PLAYER_INV_AMMO_BITS;
 extern const int ASYNC_PLAYER_INV_CLIP_BITS;
 
@@ -236,6 +252,10 @@ public:
 	int						lastHitTime;			// last time projectile fired by player hit target
 	int						lastSndHitTime;			// MP hit sound - != lastHitTime because we throttle
 	int						lastSavingThrowTime;	// for the "free miss" effect
+
+	leanState_t				currentLean;
+	float					leanAmount;				// -1.0f (full left) to 1.0f (full right)
+	float					leanOffset;				// current lateral camera offset after collision, in world units
 
 	idScriptBool			AI_FORWARD;
 	idScriptBool			AI_BACKWARD;
@@ -403,6 +423,11 @@ public:
 	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis );
 	idVec3					GetEyePosition( void ) const;
 	void					GetViewPos( idVec3 &origin, idMat3 &axis ) const;
+	idVec3					GetLeanRightVector( void ) const;
+
+	bool					IsSprinting( void ) const;
+	void					UpdateLean( int msec );
+	bool					CheckLeanCollision( float offset );
 	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 
 	bool					Give( const char *statname, const char *value );
@@ -657,6 +682,7 @@ private:
 	void					UpdateViewAngles( void );
 	void					EvaluateControls( void );
 	void					AdjustSpeed( void );
+	bool					WantsToSprint( void ) const;
 	void					AdjustBodyAngles( void );
 	void					InitAASLocation( void );
 	void					SetAASLocation( void );

@@ -99,6 +99,11 @@ public:
 	bool					IsCrouching( void ) const;
 	bool					OnLadder( void ) const;
 	const idVec3 &			PlayerGetOrigin( void ) const;	// != GetOrigin
+							// jump assists (absolute gameLocal.time deadlines)
+	int						GetCoyoteTimer( void ) const { return coyoteTimer; }
+	void					SetCoyoteTimer( const int time ) { coyoteTimer = time; }
+	int						GetJumpBufferTimer( void ) const { return jumpBufferTimer; }
+	void					SetJumpBufferTimer( const int time ) { jumpBufferTimer = time; }
 
 public:	// common physics interface
 	bool					Evaluate( int timeStepMSec, int endTimeMSec );
@@ -165,6 +170,10 @@ private:
 	bool					ladder;
 	idVec3					ladderNormal;
 
+	// jump assists (not saved: they only live for a few frames)
+	int						coyoteTimer;			// jumping is still allowed until this time after leaving the ground
+	int						jumpBufferTimer;		// a jump pressed in the air is remembered until this time
+
 	// results of last evaluate
 	waterLevel_t			waterLevel;
 	int						waterType;
@@ -188,6 +197,7 @@ private:
 	void					CheckDuck( void );
 	void					CheckLadder( void );
 	bool					CheckJump( void );
+	void					UpdateJumpAssists( void );
 	bool					CheckWaterJump( void );
 	void					SetWaterLevel( void );
 	void					DropTimers( void );

@@ -971,6 +971,10 @@ idPlayer::idPlayer() {
 	lastSndHitTime			= 0;
 	lastSavingThrowTime		= 0;
 
+	currentLean				= LEAN_NONE;
+	leanAmount				= 0.0f;
+	leanOffset				= 0.0f;
+
 	weapon					= NULL;
 
 	hud						= NULL;
@@ -1249,6 +1253,11 @@ void idPlayer::Init( void ) {
 
 	// remove any damage effects
 	playerView.ClearEffects();
+
+	// stand up straight
+	currentLean				= LEAN_NONE;
+	leanAmount				= 0.0f;
+	leanOffset				= 0.0f;
 
 	// damage values
 	fl.takedamage			= true;
@@ -5700,7 +5709,7 @@ void idPlayer::AdjustSpeed( void ) {
 	} else if ( noclip ) {
 		speed = pm_noclipspeed.GetFloat();
 		bobFrac = 0.0f;
-	} else if ( !physicsObj.OnLadder() && ( usercmd.buttons & BUTTON_RUN ) && ( usercmd.forwardmove || usercmd.rightmove ) && ( usercmd.upmove >= 0 ) ) {
+	} else if ( WantsToSprint() ) {
 		if ( !gameLocal.isMultiplayer && !physicsObj.IsCrouching() && !PowerUpActive( ADRENALINE ) ) {
 			stamina -= MS2SEC( gameLocal.msec );
 		}
@@ -5714,7 +5723,7 @@ void idPlayer::AdjustSpeed( void ) {
 		} else {
 			bobFrac = stamina / pm_staminathreshold.GetFloat();
 		}
-		speed = pm_walkspeed.GetFloat() * ( 1.0f - bobFrac ) + pm_runspeed.GetFloat() * bobFrac;
+		speed = pm_walkspeed.GetFloat() * ( 1.0f - bobFrac ) + pm_walkspeed.GetFloat() * SPRINT_SPEED_SCALE * bobFrac;
 	} else {
 		rate = pm_staminarate.GetFloat();
 
@@ -5738,6 +5747,143 @@ void idPlayer::AdjustSpeed( void ) {
 	}
 
 	physicsObj.SetSpeed( speed, pm_crouchspeed.GetFloat() );
+}
+
+/*
+==============
+idPlayer::WantsToSprint
+
+Sprint input and posture requirements, ignoring stamina.
+==============
+*/
+bool idPlayer::WantsToSprint( void ) const {
+	if ( spectating || noclip || health <= 0 ) {
+		return false;
+	}
+	if ( !( usercmd.buttons & BUTTON_RUN ) || usercmd.forwardmove <= 0 || usercmd.upmove < 0 ) {
+		return false;
+	}
+	return physicsObj.HasGroundContacts() && !physicsObj.OnLadder() && !physicsObj.IsCrouching();
+}
+
+/*
+==============
+idPlayer::IsSprinting
+
+Holding run and forward while standing on the ground, with enough stamina left.
+==============
+*/
+bool idPlayer::IsSprinting( void ) const {
+	if ( !WantsToSprint() ) {
+		return false;
+	}
+	return ( !pm_stamina.GetFloat() ) || ( stamina > pm_staminathreshold.GetFloat() );
+}
+
+/*
+==============
+idPlayer::GetLeanRightVector
+
+Horizontal right vector of the view, lean never moves the camera up or down.
+==============
+*/
+idVec3 idPlayer::GetLeanRightVector( void ) const {
+	idMat3 axis = idAngles( 0.0f, viewAngles.yaw, 0.0f ).ToMat3() * physicsObj.GetGravityAxis();
+	return -axis[ 1 ];
+}
+
+/*
+==============
+idPlayer::UpdateLean
+
+Moves leanAmount towards the lean input and computes the collision-limited leanOffset.
+==============
+*/
+void idPlayer::UpdateLean( int msec ) {
+	int		buttons;
+	float	target;
+	float	step;
+	float	frac;
+	float	desiredOffset;
+	float	previousOffset;
+	float	maxOffsetStep;
+
+	buttons = usercmd.buttons & ( BUTTON_LEAN_LEFT | BUTTON_LEAN_RIGHT );
+
+	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() ||
+		gameLocal.inCinematic || objectiveSystemOpen || influenceActive ) {
+		currentLean = LEAN_NONE;
+	} else if ( buttons == BUTTON_LEAN_LEFT ) {
+		currentLean = LEAN_LEFT;
+	} else if ( buttons == BUTTON_LEAN_RIGHT ) {
+		currentLean = LEAN_RIGHT;
+	} else {
+		// nothing or both pressed
+		currentLean = LEAN_NONE;
+	}
+
+	if ( currentLean == LEAN_LEFT ) {
+		target = -1.0f;
+	} else if ( currentLean == LEAN_RIGHT ) {
+		target = 1.0f;
+	} else {
+		target = 0.0f;
+	}
+
+	step = LEAN_SPEED * MS2SEC( msec );
+	if ( leanAmount < target ) {
+		leanAmount = Min( leanAmount + step, target );
+	} else if ( leanAmount > target ) {
+		leanAmount = Max( leanAmount - step, target );
+	}
+
+	// smoothstep so the head accelerates out and settles softly at the end
+	frac = idMath::Fabs( leanAmount );
+	frac = frac * frac * ( 3.0f - 2.0f * frac );
+	desiredOffset = ( leanAmount < 0.0f ? -frac : frac ) * LEAN_MAX_OFFSET;
+
+	previousOffset = leanOffset;
+	CheckLeanCollision( desiredOffset );
+
+	// the trace already cut leanOffset against walls. When the obstacle goes away (e.g. strafing
+	// away from a wall while leaning), glide out at the lean speed instead of popping out
+	maxOffsetStep = LEAN_MAX_OFFSET * step * 1.5f;	// 1.5 = max slope of the smoothstep
+	if ( leanOffset > 0.0f && previousOffset >= 0.0f && leanOffset > previousOffset + maxOffsetStep ) {
+		leanOffset = previousOffset + maxOffsetStep;
+	} else if ( leanOffset < 0.0f && previousOffset <= 0.0f && leanOffset < previousOffset - maxOffsetStep ) {
+		leanOffset = previousOffset - maxOffsetStep;
+	}
+}
+
+/*
+==============
+idPlayer::CheckLeanCollision
+
+Traces from the eyes towards the requested lean offset and stores in leanOffset how
+far the camera can actually go. Returns true if something blocked the lean.
+==============
+*/
+bool idPlayer::CheckLeanCollision( float offset ) {
+	trace_t	tr;
+	idVec3	start;
+	idVec3	end;
+
+	if ( offset == 0.0f ) {
+		leanOffset = 0.0f;
+		return false;
+	}
+
+	// a small box instead of a point, so the near clip plane of the camera can't poke through walls
+	const idBounds cameraBounds( idVec3( -5.0f, -5.0f, -5.0f ), idVec3( 5.0f, 5.0f, 5.0f ) );
+
+	start = GetEyePosition();
+	end = start + GetLeanRightVector() * offset;
+
+	gameLocal.clip.TraceBounds( tr, start, end, cameraBounds, MASK_PLAYERSOLID, this );
+
+	leanOffset = offset * tr.fraction;
+
+	return ( tr.fraction < 1.0f );
 }
 
 /*
@@ -6321,6 +6467,10 @@ void idPlayer::Think( void ) {
 		// clear out our pain flag so we can tell if we recieve any damage between now and the next time we think
 		AI_PAIN = false;
 	}
+
+	// procedural camera: lean offset and sprint fov
+	UpdateLean( gameLocal.msec );
+	playerView.UpdateSprintFov( gameLocal.msec );
 
 	// calculate the exact bobbed view position, which is used to
 	// position the view weapon, among other things
@@ -6974,7 +7124,11 @@ float idPlayer::CalcFov( bool honorZoom ) {
 	}
 
 	if ( zoomFov.IsDone( gameLocal.time ) ) {
-		fov = ( honorZoom && usercmd.buttons & BUTTON_ZOOM ) && weapon.GetEntity() ? weapon.GetEntity()->GetZoomFov() : DefaultFov();
+		if ( ( honorZoom && usercmd.buttons & BUTTON_ZOOM ) && weapon.GetEntity() ) {
+			fov = weapon.GetEntity()->GetZoomFov();
+		} else {
+			fov = DefaultFov() + playerView.GetSprintFovOffset();
+		}
 	} else {
 		fov = zoomFov.GetCurrentValue( gameLocal.time );
 	}
@@ -7253,6 +7407,9 @@ void idPlayer::GetViewPos( idVec3 &origin, idMat3 &axis ) const {
 	} else {
 		origin = GetEyePosition() + viewBob;
 		angles = viewAngles + viewBobAngles + playerView.AngleOffset();
+
+		// lean offset and head roll
+		playerView.CalculatePlayerView( origin, angles );
 
 		axis = angles.ToMat3() * physicsObj.GetGravityAxis();
 
@@ -7867,6 +8024,12 @@ void idPlayer::ClientPredictionThink( void ) {
 
 	// clear out our pain flag so we can tell if we recieve any damage between now and the next time we think
 	AI_PAIN = false;
+
+	// procedural camera: only once per real frame, not on every re-prediction
+	if ( entityNumber == gameLocal.localClientNum && gameLocal.isNewFrame ) {
+		UpdateLean( gameLocal.msec );
+		playerView.UpdateSprintFov( gameLocal.msec );
+	}
 
 	// calculate the exact bobbed view position, which is used to
 	// position the view weapon, among other things

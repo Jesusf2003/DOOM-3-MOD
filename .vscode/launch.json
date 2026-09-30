@@ -3,25 +3,18 @@
   "configurations": [
     {
       "name": "dhewm3: Dunwall room",
-      "type": "cppdbg",
+      "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}/bin/doom3.exe",
       "args": [
         "+set", "fs_basepath", "${workspaceFolder}/bin",
         "+set", "fs_game", "base",
-        "+map", "maps/dunwall/room"
+        "+set", "com_skipIntroVideos", "1",
+        "+map", "dunwall/room"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}/bin",
-      "environment": [
-        {
-          "name": "PATH",
-          "value": "C:\\msys64\\mingw64\\bin;${env:PATH}"
-        }
-      ],
-      "externalConsole": true,
-      "MIMode": "gdb",
-      "miDebuggerPath": "C:\\msys64\\mingw64\\bin\\gdb.exe",
+      "console": "externalTerminal",
       "preLaunchTask": "CMake: build"
     }
   ]

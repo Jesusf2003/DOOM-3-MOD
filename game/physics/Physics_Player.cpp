@@ -55,6 +55,11 @@ const float PM_NOCLIPFRICTION	= 12.0f;
 const float MIN_WALK_NORMAL		= 0.7f;		// can't walk on very steep slopes
 const float OVERCLIP			= 1.001f;
 
+// jump assists
+const int PM_COYOTE_MSEC		= 150;		// grace time to jump after walking off a ledge
+const int PM_JUMPBUFFER_MSEC	= 150;		// a jump pressed this long before landing still fires
+const float PM_FALL_GRAVITY_SCALE	= 1.8f;	// gravity multiplier while falling, removes the floaty jump
+
 // movementFlags
 const int PMF_DUCKED			= 1;		// set when ducking
 const int PMF_JUMPED			= 2;		// set when the player jumped this frame
@@ -629,6 +634,11 @@ void idPhysics_Player::AirMove( void ) {
 	// not on ground, so little effect on velocity
 	idPhysics_Player::Accelerate( wishdir, wishspeed, PM_AIRACCELERATE );
 
+	// asymmetric gravity: fall faster than we rise. SlideMove adds 1g, add the rest here
+	if ( current.velocity * gravityNormal > 0.0f ) {
+		current.velocity += gravityVector * ( ( PM_FALL_GRAVITY_SCALE - 1.0f ) * frametime );
+	}
+
 	// we may have a ground plane that is very steep, even
 	// though we don't have a groundentity
 	// slide along the steep plane
@@ -1180,20 +1190,34 @@ idPhysics_Player::CheckJump
 */
 bool idPhysics_Player::CheckJump( void ) {
 	idVec3 addVelocity;
+	bool pressed, buffered;
 
-	if ( command.upmove < 10 ) {
-		// not holding jump
+	// fresh press of the jump button (must wait for jump to be released)
+	pressed = ( command.upmove >= 10 ) && !( current.movementFlags & PMF_JUMP_HELD );
+	// jump pressed shortly before touching the ground
+	buffered = ( jumpBufferTimer > gameLocal.time );
+
+	if ( !pressed && !buffered ) {
 		return false;
 	}
 
-	// must wait for jump to be released
-	if ( current.movementFlags & PMF_JUMP_HELD ) {
+	// must be on the ground or inside the coyote time window
+	if ( !walking && coyoteTimer <= gameLocal.time ) {
 		return false;
 	}
 
 	// don't jump if we can't stand up
 	if ( current.movementFlags & PMF_DUCKED ) {
 		return false;
+	}
+
+	// consume the assists so a single press can't jump twice
+	coyoteTimer = 0;
+	jumpBufferTimer = 0;
+
+	// a coyote jump starts while already falling, cancel the downward speed so it is a full jump
+	if ( current.velocity * gravityNormal > 0.0f ) {
+		current.velocity -= ( current.velocity * gravityNormal ) * gravityNormal;
 	}
 
 	groundPlane = false;		// jumping away
@@ -1205,6 +1229,27 @@ bool idPhysics_Player::CheckJump( void ) {
 	current.velocity += addVelocity;
 
 	return true;
+}
+
+/*
+=============
+idPhysics_Player::UpdateJumpAssists
+
+Refreshes the coyote time while on the ground and buffers jump presses made in the air.
+=============
+*/
+void idPhysics_Player::UpdateJumpAssists( void ) {
+	if ( walking ) {
+		coyoteTimer = gameLocal.time + PM_COYOTE_MSEC;
+		return;
+	}
+
+	// pressed in the air after the coyote window: remember it until we land
+	if ( command.upmove >= 10 && !( current.movementFlags & PMF_JUMP_HELD ) && coyoteTimer <= gameLocal.time ) {
+		jumpBufferTimer = gameLocal.time + PM_JUMPBUFFER_MSEC;
+		// latch the press so holding the button doesn't keep refreshing the buffer
+		current.movementFlags |= PMF_JUMP_HELD;
+	}
 }
 
 /*
@@ -1392,6 +1437,14 @@ void idPhysics_Player::MovePlayer( int msec ) {
 	// handle timers
 	idPhysics_Player::DropTimers();
 
+	// coyote time and jump buffering only apply to regular ground / air movement
+	if ( current.movementType == PM_DEAD || ladder || waterLevel > 1 || ( current.movementFlags & PMF_TIME_WATERJUMP ) ) {
+		coyoteTimer = 0;
+		jumpBufferTimer = 0;
+	} else {
+		idPhysics_Player::UpdateJumpAssists();
+	}
+
 	// move
 	if ( current.movementType == PM_DEAD ) {
 		// dead
@@ -1414,7 +1467,8 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		idPhysics_Player::WalkMove();
 	}
 	else {
-		// airborne
+		// airborne, may still jump during coyote time
+		idPhysics_Player::CheckJump();
 		idPhysics_Player::AirMove();
 	}
 
@@ -1518,6 +1572,8 @@ idPhysics_Player::idPhysics_Player( void ) {
 	groundMaterial = NULL;
 	ladder = false;
 	ladderNormal.Zero();
+	coyoteTimer = 0;
+	jumpBufferTimer = 0;
 	waterLevel = WATERLEVEL_NONE;
 	waterType = 0;
 }

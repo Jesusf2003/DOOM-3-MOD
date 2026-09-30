@@ -37,6 +37,18 @@ If you have questions concerning this license or the applicable additional terms
 #include "PlayerView.h"
 
 const int IMPULSE_DELAY = 150;
+
+const float SPRINT_FOV_BOOST = 8.0f;		// extra degrees of fov at full sprint
+const float SPRINT_FOV_RATE = 8.0f;			// exponential ease rate, higher is snappier
+
+/*
+==============
+LerpFloat
+==============
+*/
+static ID_INLINE float LerpFloat( const float from, const float to, const float frac ) {
+	return from + ( to - from ) * frac;
+}
 /*
 ==============
 idPlayerView::idPlayerView
@@ -197,6 +209,7 @@ void idPlayerView::ClearEffects() {
 
 	fadeTime = 0;
 	bfgVision = false;
+	sprintFovOffset = 0.0f;
 }
 
 /*
@@ -425,6 +438,55 @@ idAngles idPlayerView::AngleOffset() const {
 		}
 	}
 	return ang;
+}
+
+/*
+==================
+idPlayerView::CalculatePlayerView
+
+Shifts the first person camera sideways by the lean offset and rolls the head with it.
+leanOffset is already limited by idPlayer::CheckLeanCollision, so this never enters walls.
+==================
+*/
+void idPlayerView::CalculatePlayerView( idVec3 &origin, idAngles &angles ) const {
+	if ( player == NULL || player->leanOffset == 0.0f ) {
+		return;
+	}
+
+	origin += player->GetLeanRightVector() * player->leanOffset;
+	angles.roll += ( player->leanOffset / LEAN_MAX_OFFSET ) * LEAN_MAX_ROLL;
+}
+
+/*
+==================
+idPlayerView::UpdateSprintFov
+
+Eases the sprint fov in and out. The boost is kept during a sprint jump as long as the
+player still carries more than walking speed, so jumping doesn't make the fov pump.
+==================
+*/
+void idPlayerView::UpdateSprintFov( int msec ) {
+	float target = 0.0f;
+
+	if ( player != NULL && player->health > 0 ) {
+		if ( player->IsSprinting() ) {
+			target = SPRINT_FOV_BOOST;
+		} else if ( sprintFovOffset > 0.0f && !player->GetPhysics()->HasGroundContacts() ) {
+			const idVec3 &gravityNormal = player->GetPhysics()->GetGravityNormal();
+			idVec3 vel = player->GetPhysics()->GetLinearVelocity();
+			vel -= ( vel * gravityNormal ) * gravityNormal;
+			if ( vel.LengthSqr() > Square( pm_walkspeed.GetFloat() * 1.1f ) ) {
+				target = SPRINT_FOV_BOOST;
+			}
+		}
+	}
+
+	// frame rate independent exponential ease
+	const float frac = 1.0f - idMath::Exp( -SPRINT_FOV_RATE * MS2SEC( msec ) );
+	sprintFovOffset = LerpFloat( sprintFovOffset, target, frac );
+	if ( idMath::Fabs( sprintFovOffset - target ) < 0.01f ) {
+		sprintFovOffset = target;
+	}
 }
 
 /*
