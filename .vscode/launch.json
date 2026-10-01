@@ -7,10 +7,8 @@
       "request": "launch",
       "program": "${workspaceFolder}/bin/doom3.exe",
       "args": [
-        "+set", "fs_basepath", "${workspaceFolder}/bin",
-        "+set", "fs_game", "base",
-        "+set", "com_skipIntroVideos", "1",
-        "+map", "dunwall/room"
+        "+dmap", "dunwall/room",
+        "+map", "dunwall/room.map"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}/bin",

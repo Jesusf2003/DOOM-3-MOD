@@ -75,7 +75,8 @@ const int PM_SLIDE_COOLDOWN_MSEC	= 500;		// time after a slide ends before anoth
 const float PM_SLIDE_LAND_SPEED_SCALE	= 1.3f;	// landing with crouch held slides if faster than pm_walkspeed * this
 
 // vault / ledge grab, heights are measured from the feet
-const int PM_VAULT_INPUT_BUFFER_MSEC	= 200;		// a fresh jump press can start a vault for this long (holding jump never does)
+const int PM_VAULT_INPUT_BUFFER_MSEC	= 250;		// a jump press can start a vault for this long; holding jump in the air renews it
+const float PM_VAULT_HOLD_MIN_UPSPEED	= -60.0f;	// holding jump keeps searching while rising and around the apex (falling slower than this)
 const float PM_VAULT_WAIST_HEIGHT	= 22.0f;	// lower probe
 const float PM_VAULT_HEAD_HEIGHT	= 68.0f;	// upper probe
 const float PM_VAULT_TOP_HEIGHT		= 92.0f;	// above the head, must be free to grab a high ledge
@@ -92,19 +93,31 @@ const float PM_VAULT_LAND_INSET		= 2.0f;		// the back of the box ends this far p
 const float PM_VAULT_TARGET_CLEARANCE	= 2.0f;		// kinematic moves end this far above the top, gravity settles the rest
 const int PM_VAULT_COOLDOWN_MSEC	= 300;		// no new vault right after one ends
 const int PM_VAULT_OVERTIME_MSEC	= 150;		// extra time for a low vault to reach its landing spot if the arc was blocked
+const float PM_VAULT_SWEEP_STEP		= 4.0f;		// the kinematic move of a frame is swept in substeps of at most this length
+const float PM_VAULT_CEILING_GAP	= 1.0f;		// crouched under a low ceiling, the probes run this far below it
+const float PM_VAULT_START_HEADROOM	= 1.0f;		// a vault never starts with the box closer than this to a ceiling
+const float PM_VAULT_FIT_MARGIN		= 1.0f;		// the box must fit at the landing spot with this much room on every side
+const float PM_VAULT_OPENING_STEP	= 6.0f;		// height step of the probes that look for an opening in a wall (vent, duct)
+const float PM_VAULT_NUDGE_MAX		= 2.0f;		// a box caught in overlapping brushes may be pushed this far back out of the face
 
-// low vault (VAULT_LOW)
-const int PM_VAULT_LOW_MSEC			= 235;		// shortest duration T of the parabolic pass, long enough to feel the body weight
-const int PM_VAULT_LOW_MAX_MSEC		= 300;		// longest T; slower run-ups get a small speed boost instead
+// low vault (VAULT_LOW). Duration follows horizontal speed at takeoff; low speed and crouching
+// take longer, while sprinting carries the player across without losing momentum.
+const float PM_VAULT_LOW_SLOW_SPEED		= 90.0f;
+const float PM_VAULT_LOW_WALK_SPEED		= 140.0f;
+const float PM_VAULT_LOW_SPRINT_SPEED	= 200.0f;
+const int PM_VAULT_LOW_CROUCH_MSEC		= 490;
+const int PM_VAULT_LOW_WALK_MSEC			= 405;
+const int PM_VAULT_LOW_SPRINT_MSEC		= 270;
 const float PM_VAULT_LOW_ARC		= 10.0f;	// H_clearance: the arc peaks this far above the edge
 
-// ledge grab (VAULT_HIGH_GRAB -> VAULT_CLIMBING -> VAULT_MANTLE)
-const int PM_VAULT_ABSORB_MSEC		= 70;		// phase 1: the hands hit the ledge
-const float PM_VAULT_ABSORB_TAU		= 0.025f;	// phase 1: time constant (seconds) of the exponential braking
-const int PM_VAULT_RISE_MSEC		= 180;		// phase 2: EaseOutCubic pull up
-const int PM_VAULT_MANTLE_MSEC		= 100;		// phase 3: EaseInQuad over the edge (shorter if the run-up was faster than the curve)
+// ledge grab (VAULT_HIGH_GRAB -> VAULT_CLIMBING -> VAULT_MANTLE). The total of the three phases only
+// depends on the ledge height and is split between them with the fractions below
+const int PM_VAULT_HIGH_DURATION_MSEC		= 650;	// total at the lowest ledge (just above PM_VAULT_LOW_MAX_HEIGHT)...
+const int PM_VAULT_HIGH_DURATION_MAX_MSEC	= 850;	// ...growing linearly up to this at PM_VAULT_TOP_HEIGHT
+const float PM_VAULT_ABSORB_FRAC	= 0.15f;	// phase 1 share: the hands hit the ledge
+const float PM_VAULT_MANTLE_FRAC	= 0.25f;	// phase 3 share: EaseInQuad over the edge. Phase 2 (EaseOutCubic pull up) gets the rest
+const float PM_VAULT_ABSORB_TAU		= 0.035f;	// phase 1: time constant (seconds) of the exponential braking
 const float PM_VAULT_MANTLE_OVERLAP	= 8.0f;		// phase 3 ends with the front of the box this far past the edge
-const float PM_VAULT_APPROACH_MIN_SPEED	= 50.0f;	// low vault: slower than this towards the obstacle, start right away
 const float PM_LEDGE_JUMP_SPEED		= 320.0f;	// upward speed of a ledge jump (fresh jump press during phase 1 or 2)
 const float PM_LEDGE_JUMP_FORWARD	= 80.0f;	// forward speed of a ledge jump
 const int PM_LEDGE_JUMP_MIN_MSEC	= 100;		// presses this soon after the grab are ignored (double taps are not ledge jumps)
@@ -1136,13 +1149,19 @@ void idPhysics_Player::CheckDuck( void ) {
 	if ( current.movementType == PM_DEAD ) {
 		maxZ = pm_deadheight.GetFloat();
 	} else {
-		// stand up when up against a ladder, a slide keeps us down even if crouch is released
-		if ( ( command.upmove < 0 || isSliding ) && !ladder ) {
-			// duck
-			current.movementFlags |= PMF_DUCKED;
-		} else {
-			// stand up only if there is room above our head, otherwise stay crouched
-			if ( ( current.movementFlags & PMF_DUCKED ) && CanUncrouch() ) {
+		// stand up when up against a ladder. A slide keeps us down even if crouch is released, and so
+		// does a latched crouch (pm_toggleCrouch) while jump is pressed: that jump is a crouch jump
+		if ( ( command.upmove < 0 || isSliding || crouchLatched ) && !ladder ) {
+			if ( !( current.movementFlags & PMF_DUCKED ) ) {
+				current.movementFlags |= PMF_DUCKED;
+				if ( idPhysics_Player::IsAirborne() ) {
+					idPhysics_Player::TuckLegs();
+				}
+			}
+		} else if ( current.movementFlags & PMF_DUCKED ) {
+			// stand up only if there is room, otherwise stay crouched. In the air the legs come down
+			// first and the head only goes up by what the floor below doesn't allow
+			if ( idPhysics_Player::IsAirborne() ? idPhysics_Player::StandUpInAir() : idPhysics_Player::HasHeadroom() ) {
 				current.movementFlags &= ~PMF_DUCKED;
 			}
 		}
@@ -1190,7 +1209,110 @@ bool idPhysics_Player::CanUncrouch( void ) const {
 	if ( !( current.movementFlags & PMF_DUCKED ) ) {
 		return true;
 	}
-	return idPhysics_Player::HasHeadroom();
+	if ( idPhysics_Player::HasHeadroom() ) {
+		return true;
+	}
+	// in the air the legs can come down instead
+	return idPhysics_Player::IsAirborne() && idPhysics_Player::HasFootroom();
+}
+
+/*
+================
+idPhysics_Player::IsAirborne
+
+Regular movement off the ground: crouching here tucks the legs instead of lowering the head.
+================
+*/
+bool idPhysics_Player::IsAirborne( void ) const {
+	return current.movementType == PM_NORMAL && !walking && !ladder && waterLevel <= WATERLEVEL_FEET;
+}
+
+/*
+================
+idPhysics_Player::HasFootroom
+
+The crouch sized box can grow to standing height downwards here (in the air).
+================
+*/
+bool idPhysics_Player::HasFootroom( void ) const {
+	trace_t	trace;
+	const float shift = pm_normalheight.GetFloat() - clipModel->GetBounds()[1][2];
+
+	if ( shift <= 0.0f ) {
+		return true;
+	}
+	gameLocal.clip.Translation( trace, current.origin, current.origin + gravityNormal * shift, clipModel, clipModel->GetAxis(), clipMask, self );
+	return ( trace.fraction >= 1.0f );
+}
+
+/*
+================
+idPhysics_Player::TuckLegs
+
+Crouching in the air (crouch jump): the box shrinks from the bottom instead of the top, so the head
+stays where it was and the feet go up, clearing higher ledges and getting into vents. The crouched
+box ends up inside the space the standing box already had, so this can't put it into anything.
+idPlayer moves the eye down by the same amount so the camera doesn't jump.
+================
+*/
+void idPhysics_Player::TuckLegs( void ) {
+	const float shift = clipModel->GetBounds()[1][2] - pm_crouchheight.GetFloat();
+
+	if ( shift <= 0.0f ) {
+		return;
+	}
+	current.origin -= gravityNormal * shift;
+	duckOriginShift += shift;
+}
+
+/*
+================
+idPhysics_Player::StandUpInAir
+
+Standing up in the air puts the legs down as far as the floor below allows and only raises the head
+for the rest, which needs room above it. Returns false (nothing moved) if the standing box doesn't fit.
+================
+*/
+bool idPhysics_Player::StandUpInAir( void ) {
+	trace_t	trace;
+	idVec3	lowered;
+	float	shift, dropped;
+
+	shift = pm_normalheight.GetFloat() - clipModel->GetBounds()[1][2];
+	if ( shift <= 0.0f ) {
+		return true;
+	}
+
+	// legs down
+	gameLocal.clip.Translation( trace, current.origin, current.origin + gravityNormal * shift, clipModel, clipModel->GetAxis(), clipMask, self );
+	lowered = trace.endpos;
+	dropped = ( lowered - current.origin ) * gravityNormal;
+
+	// what the floor didn't allow comes off the top: sweep the crouch box up from the lowered spot,
+	// its top then covers exactly the part of the standing box that isn't known to be free yet
+	if ( dropped < shift - 0.01f ) {
+		gameLocal.clip.Translation( trace, lowered, lowered - gravityNormal * shift, clipModel, clipModel->GetAxis(), clipMask, self );
+		if ( trace.fraction < 1.0f ) {
+			return false;
+		}
+	}
+
+	current.origin = lowered;
+	duckOriginShift -= dropped;
+	return true;
+}
+
+/*
+================
+idPhysics_Player::ConsumeDuckOriginShift
+
+How far crouching / standing up in the air moved the origin up since the last call.
+================
+*/
+float idPhysics_Player::ConsumeDuckOriginShift( void ) {
+	const float shift = duckOriginShift;
+	duckOriginShift = 0.0f;
+	return shift;
 }
 
 /*
@@ -1333,6 +1455,23 @@ static bool VaultPathClear( const idVec3 &from, const idVec3 &to, const idBounds
 
 /*
 ================
+LowVaultPathClear
+
+The arc of a low vault: straight up to arc above the edge, over to the landing spot, down onto it.
+================
+*/
+static bool LowVaultPathClear( const idVec3 &from, const idVec3 &standSpot, const idVec3 &up, float ledgeHeight, float arc,
+		const idBounds &bounds, int mask, const idEntity *pass ) {
+	const idVec3 peak = from + up * ( ledgeHeight + arc );
+	const idVec3 over = standSpot + up * ( arc - PM_VAULT_TARGET_CLEARANCE );
+
+	return VaultPathClear( from, peak, bounds, mask, pass ) &&
+		VaultPathClear( peak, over, bounds, mask, pass ) &&
+		VaultPathClear( over, standSpot, bounds, mask, pass );
+}
+
+/*
+================
 idPhysics_Player::CheckVaultOpportunity
 
 Finds a climbable obstacle in front of the player with geometry probes, no map triggers needed:
@@ -1342,16 +1481,19 @@ The face must be PM_VAULT_MIN_DIST..PM_VAULT_MAX_DIST in front of us and at most
 off the view. Then probes down behind the face for a walkable top, checks the player box
 fits there (standing or crouched) and that the way there is free for the move that will be
 used: the arc of a low vault or the straight pull up of a ledge grab.
+A crouched player vaults as is: the probes stay under a low ceiling and the way is checked with
+the crouch sized box, so there is no need to stand up first.
 outTargetPos is where the player ends up standing: on top, just past the edge.
+outArc is how far above the edge a low vault passes.
 ================
 */
-bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch, float probeDist, float *outWallDist ) {
-	trace_t			waistTrace, headTrace, topTrace, ledgeTrace;
+bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch, float probeDist, float *outWallDist, float *outArc ) {
+	trace_t			waistTrace, headTrace, topTrace, ledgeTrace, ceilingTrace, openingTrace, openingWall;
 	const trace_t *	wall;
 	idVec3			up, forward, start, flat, ledgeSpot, standSpot, peak;
 	idBounds		bounds, pathBounds;
-	float			probeTop, ledgeHeight, halfWidth, wallDist;
-	bool			crouch;
+	float			probeTop, ledgeHeight, halfWidth, wallDist, headHeight, topHeight, arc;
+	bool			crouch, ducked;
 	int				mask;
 
 	up = -gravityNormal;
@@ -1362,28 +1504,69 @@ bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &out
 
 	halfWidth = clipModel->GetBounds()[1][0];
 	mask = clipMask & ~CONTENTS_BODY;		// never climb onto monsters or other players
+	ducked = ( current.movementFlags & PMF_DUCKED ) != 0;
+
+	// crouched, the ceiling can be lower than the head probes: a probe that starts inside it never
+	// finds the obstacle, so keep them just under whatever is above the player
+	headHeight = PM_VAULT_HEAD_HEIGHT;
+	topHeight = PM_VAULT_TOP_HEIGHT;
+	if ( ducked ) {
+		start = current.origin + up * PM_VAULT_CEILING_GAP;
+		gameLocal.clip.TracePoint( ceilingTrace, start, current.origin + up * PM_VAULT_TOP_HEIGHT, mask, self );
+		if ( ceilingTrace.fraction < 1.0f ) {
+			const float ceiling = ( ceilingTrace.endpos - current.origin ) * up;
+			topHeight = ceiling - PM_VAULT_CEILING_GAP;
+			headHeight = Min( headHeight, topHeight );
+			if ( headHeight <= PM_VAULT_WAIST_HEIGHT ) {
+				return false;
+			}
+		}
+	}
 
 	// 1. waist and head probes
 	start = current.origin + up * PM_VAULT_WAIST_HEIGHT;
 	gameLocal.clip.TracePoint( waistTrace, start, start + forward * probeDist, mask, self );
-	start = current.origin + up * PM_VAULT_HEAD_HEIGHT;
+	start = current.origin + up * headHeight;
 	gameLocal.clip.TracePoint( headTrace, start, start + forward * probeDist, mask, self );
 
 	// 2. classify
+	wall = NULL;
+	probeTop = 0.0f;
 	if ( IsVaultWall( waistTrace, forward, up ) && headTrace.fraction >= 1.0f ) {
 		wall = &waistTrace;
-		probeTop = PM_VAULT_HEAD_HEIGHT;
-	} else if ( IsVaultWall( headTrace, forward, up ) ) {
+		probeTop = headHeight;
+	} else if ( IsVaultWall( headTrace, forward, up ) && topHeight > headHeight ) {
 		// high ledge: there must be room above the head
-		start = current.origin + up * PM_VAULT_TOP_HEIGHT;
+		start = current.origin + up * topHeight;
 		gameLocal.clip.TracePoint( topTrace, start, start + forward * probeDist, mask, self );
-		if ( topTrace.fraction < 1.0f ) {
+		if ( topTrace.fraction >= 1.0f ) {
+			wall = &headTrace;
+			probeTop = topHeight;
+		}
+	}
+	if ( wall == NULL ) {
+		// a wall at the waist that goes on above the head: look for an opening in it (vent, duct,
+		// window). The lowest free probe is the opening, the face is the last hit just below it
+		if ( !IsVaultWall( waistTrace, forward, up ) ) {
 			return false;
 		}
-		wall = &headTrace;
-		probeTop = PM_VAULT_TOP_HEIGHT;
-	} else {
-		return false;
+		openingWall = waistTrace;
+		for ( float h = PM_VAULT_WAIST_HEIGHT + PM_VAULT_OPENING_STEP; h <= topHeight; h += PM_VAULT_OPENING_STEP ) {
+			start = current.origin + up * h;
+			gameLocal.clip.TracePoint( openingTrace, start, start + forward * probeDist, mask, self );
+			if ( openingTrace.fraction >= 1.0f ) {
+				wall = &openingWall;
+				probeTop = h;
+				break;
+			}
+			if ( !IsVaultWall( openingTrace, forward, up ) ) {
+				return false;
+			}
+			openingWall = openingTrace;
+		}
+		if ( wall == NULL ) {
+			return false;
+		}
 	}
 
 	wallDist = wall->fraction * probeDist;
@@ -1406,29 +1589,41 @@ bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &out
 	ledgeHeight = ( ledgeTrace.endpos - current.origin ) * up;
 	outType = ( ledgeHeight <= PM_VAULT_LOW_MAX_HEIGHT ) ? VAULT_LOW : VAULT_HIGH_GRAB;
 
-	// 4. the box must fit on top, just past the edge: standing, or at least crouched
+	// 4. the box must fit on top, just past the edge, with PM_VAULT_FIT_MARGIN to spare: standing, or at
+	// least crouched. Checked before anything moves, a spot that doesn't fit cancels the vault
 	standSpot = current.origin + flat + forward * ( halfWidth + PM_VAULT_LAND_INSET ) + up * ( ledgeHeight + PM_VAULT_TARGET_CLEARANCE );
-	crouch = false;
-	if ( !VaultBoxFits( standSpot, PlayerBounds( false ), clipMask, self ) ) {
+	crouch = ducked;
+	if ( crouch || !VaultBoxFits( standSpot, PlayerBounds( false ).Expand( PM_VAULT_FIT_MARGIN ), clipMask, self ) ) {
 		crouch = true;
-		if ( !VaultBoxFits( standSpot, PlayerBounds( true ), clipMask, self ) ) {
+		if ( !VaultBoxFits( standSpot, PlayerBounds( true ).Expand( PM_VAULT_FIT_MARGIN ), clipMask, self ) ) {
 			return false;
 		}
 	}
 
-	// 5. the way there must be free
+	// 5. the way there must be free, checked with the box the move will really use, so the camera (which
+	// stays inside that box) can't be taken into a ceiling either
+	arc = PM_VAULT_LOW_ARC;
 	if ( outType == VAULT_LOW ) {
-		// low vaults pass with the crouch sized box along an arc that peaks PM_VAULT_LOW_ARC above the edge
-		pathBounds = PlayerBounds( true );
-		peak = current.origin + up * ( ledgeHeight + PM_VAULT_LOW_ARC );
-		if ( !VaultPathClear( current.origin, peak, pathBounds, clipMask, self ) ||
-			!VaultPathClear( peak, standSpot + up * ( PM_VAULT_LOW_ARC - PM_VAULT_TARGET_CLEARANCE ), pathBounds, clipMask, self ) ||
-			!VaultPathClear( standSpot + up * ( PM_VAULT_LOW_ARC - PM_VAULT_TARGET_CLEARANCE ), standSpot, pathBounds, clipMask, self ) ) {
+		// arc that peaks PM_VAULT_LOW_ARC above the edge, or a flat pass that only keeps the landing
+		// clearance when that hits the ceiling. Standing if there is room for it, otherwise crouched
+		bool found = false;
+		for ( int crouched = crouch ? 1 : 0; crouched < 2 && !found; crouched++ ) {
+			pathBounds = PlayerBounds( crouched != 0 );
+			for ( int flatArc = 0; flatArc < 2 && !found; flatArc++ ) {
+				arc = flatArc ? PM_VAULT_TARGET_CLEARANCE : PM_VAULT_LOW_ARC;
+				if ( LowVaultPathClear( current.origin, standSpot, up, ledgeHeight, arc, pathBounds, clipMask, self ) ) {
+					found = true;
+					crouch = ( crouched != 0 );
+				}
+			}
+		}
+		if ( !found ) {
 			return false;
 		}
 	} else {
-		// ledge grabs pull straight up along the wall, then over the edge
-		pathBounds = PlayerBounds( crouch || ( current.movementFlags & PMF_DUCKED ) );
+		// ledge grabs pull straight up along the wall, then over the edge. A crouched player keeps
+		// the crouch sized box for the whole climb
+		pathBounds = PlayerBounds( crouch );
 		peak = current.origin + up * ( ledgeHeight + PM_VAULT_TARGET_CLEARANCE );
 		if ( !VaultPathClear( current.origin, peak, pathBounds, clipMask, self ) ||
 			!VaultPathClear( peak, standSpot, pathBounds, clipMask, self ) ) {
@@ -1441,27 +1636,58 @@ bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &out
 	if ( outCrouch ) {
 		*outCrouch = crouch;
 	}
+	if ( outArc ) {
+		*outArc = arc;
+	}
 	return true;
+}
+
+/*
+================
+VaultDuration
+
+Linear from minMsec at minHeight to maxMsec at maxHeight, clamped.
+================
+*/
+static int VaultDuration( float height, float minHeight, float maxHeight, int minMsec, int maxMsec ) {
+	const float f = idMath::ClampFloat( 0.0f, 1.0f, ( height - minHeight ) / Max( maxHeight - minHeight, 1.0f ) );
+	return minMsec + idMath::Ftoi( f * ( maxMsec - minMsec ) );
 }
 
 /*
 ================
 LowVaultTiming
 
-With Z(t) = (H + C) sin( pi t / T ) the bottom of the box is above the edge only after the fraction
-asin( Hedge / ( H + C ) ) / pi of T. To pass without ever stopping against the obstacle, the box has
-to reach the face exactly then, and still cover the rest (its own depth) in the remaining time.
-Keeps the run-up speed and stretches T for that (up to PM_VAULT_LOW_MAX_MSEC); only slower run-ups
-are sped up. Returns the pass speed, its duration and the gap to the face it needs at the start.
+Interpolates the low vault duration between crouched/slow, walking, and sprinting movement.
 ================
 */
-static void LowVaultTiming( float runUpSpeed, float height, float edgeHeight, float overDist, float &outSpeed, float &outSec, float &outGap ) {
-	const float clearFrac = idMath::ASin( idMath::ClampFloat( 0.0f, 1.0f, edgeHeight / ( height + PM_VAULT_LOW_ARC ) ) ) / idMath::PI;
-	const float overFrac = 1.0f - clearFrac;
+static int LowVaultTiming( float speed, bool crouched ) {
+	if ( crouched || speed <= PM_VAULT_LOW_SLOW_SPEED ) {
+		return PM_VAULT_LOW_CROUCH_MSEC;
+	}
+	if ( speed < PM_VAULT_LOW_WALK_SPEED ) {
+		const float fraction = idMath::ClampFloat( 0.0f, 1.0f,
+			( speed - PM_VAULT_LOW_SLOW_SPEED ) / ( PM_VAULT_LOW_WALK_SPEED - PM_VAULT_LOW_SLOW_SPEED ) );
+		return PM_VAULT_LOW_CROUCH_MSEC + idMath::Ftoi( fraction * ( PM_VAULT_LOW_WALK_MSEC - PM_VAULT_LOW_CROUCH_MSEC ) );
+	}
+	if ( speed < PM_VAULT_LOW_SPRINT_SPEED ) {
+		const float fraction = idMath::ClampFloat( 0.0f, 1.0f,
+			( speed - PM_VAULT_LOW_WALK_SPEED ) / ( PM_VAULT_LOW_SPRINT_SPEED - PM_VAULT_LOW_WALK_SPEED ) );
+		return PM_VAULT_LOW_WALK_MSEC + idMath::Ftoi( fraction * ( PM_VAULT_LOW_SPRINT_MSEC - PM_VAULT_LOW_WALK_MSEC ) );
+	}
+	return PM_VAULT_LOW_SPRINT_MSEC;
+}
 
-	outSec = idMath::ClampFloat( MS2SEC( PM_VAULT_LOW_MSEC ), MS2SEC( PM_VAULT_LOW_MAX_MSEC ), overDist / ( Max( runUpSpeed, 1.0f ) * overFrac ) );
-	outSpeed = Max( runUpSpeed, overDist / ( overFrac * outSec ) );
-	outGap = outSpeed * clearFrac * outSec;
+/*
+================
+LowVaultClearFrac
+
+With Z(t) = (H + C) sin( pi t / T ) the bottom of the box is above the edge only after this fraction
+of T: asin( Hedge / ( H + C ) ) / pi. The box must not reach the face before then.
+================
+*/
+static float LowVaultClearFrac( float height, float edgeHeight, float arc ) {
+	return idMath::ASin( idMath::ClampFloat( 0.0f, 1.0f, edgeHeight / ( height + arc ) ) ) / idMath::PI;
 }
 
 /*
@@ -1473,10 +1699,10 @@ reaching the obstacle, or while already in front of it, starts a vault. Holding 
 ================
 */
 bool idPhysics_Player::CheckVaultStart( void ) {
-	trace_t			wallTrace;
+	trace_t			wallTrace, startTrace;
 	idVec3			standSpot, up, flatVelocity, flat;
 	vaultState_t	type;
-	float			flatDist, wallFaceDist, halfWidth, probeDist, wallDist;
+	float			flatDist, wallFaceDist, halfWidth, probeDist, wallDist, arc;
 	bool			crouch;
 
 	if ( vaultInputBuffer <= gameLocal.time ) {
@@ -1488,6 +1714,19 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 	if ( gameLocal.time < vaultCooldownTimer || command.forwardmove < 0 ) {
 		return false;
 	}
+
+	// the kinematic move must start from a valid spot: not with the box overlapping something (a seam of
+	// overlapping brushes is tolerated, the box is nudged back out of it), and not pressed against a
+	// ceiling, where it couldn't rise anyway
+	flat = viewForward - ( viewForward * gravityNormal ) * gravityNormal;
+	if ( flat.Normalize() < 0.001f || !idPhysics_Player::NudgeOutOfSolid( -flat ) ) {
+		return false;
+	}
+	gameLocal.clip.Translation( startTrace, current.origin, current.origin - gravityNormal * PM_VAULT_START_HEADROOM, clipModel, clipModel->GetAxis(), clipMask, self );
+	if ( startTrace.fraction < 1.0f ) {
+		return false;
+	}
+
 	flatVelocity = current.velocity - ( current.velocity * gravityNormal ) * gravityNormal;
 
 	// on the ground, also look as far ahead as we will get while the press is still buffered
@@ -1495,7 +1734,7 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 	if ( walking ) {
 		probeDist += flatVelocity.Length() * MS2SEC( vaultInputBuffer - gameLocal.time );
 	}
-	if ( !idPhysics_Player::CheckVaultOpportunity( wallTrace, standSpot, type, &crouch, probeDist, &wallDist ) ) {
+	if ( !idPhysics_Player::CheckVaultOpportunity( wallTrace, standSpot, type, &crouch, probeDist, &wallDist, &arc ) ) {
 		return false;
 	}
 	up = -gravityNormal;
@@ -1520,23 +1759,10 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 		return false;
 	}
 
-	if ( type == VAULT_LOW ) {
-		// inside the range, keep closing in until the gap is what the pass needs to never stop against
-		// the obstacle. Start anyway if we are slow, at the near end of the range, or the press is expiring
-		const float height = ( standSpot - current.origin ) * up;
-		float passSpeed, passSec, passGap;
-		LowVaultTiming( approachSpeed, height, height - PM_VAULT_TARGET_CLEARANCE, 2.0f * halfWidth + PM_VAULT_LAND_INSET, passSpeed, passSec, passGap );
-		const float idealGap = Max( minGap, passGap + approachSpeed * frametime + 1.0f );
-		if ( gap > idealGap && gap - approachSpeed * frametime >= minGap && approachSpeed > PM_VAULT_APPROACH_MIN_SPEED &&
-				gameLocal.time + framemsec < vaultInputBuffer ) {
-			current.movementFlags |= PMF_JUMP_HELD;
-			return false;
-		}
-	}
-
 	if ( pm_vaultDebug.GetBool() ) {
-		gameLocal.Printf( "vault: %s ledge %.1f gap %.1f crouch %d speed %.0f %s\n", type == VAULT_LOW ? "LOW" : "HIGH",
-			( standSpot - current.origin ) * up - PM_VAULT_TARGET_CLEARANCE, gap, crouch, flatVelocity.Length(), walking ? "ground" : "air" );
+		gameLocal.Printf( "vault: %s ledge %.1f gap %.1f crouch %d ducked %d arc %.0f speed %.0f %s\n", type == VAULT_LOW ? "LOW" : "HIGH",
+			( standSpot - current.origin ) * up - PM_VAULT_TARGET_CLEARANCE, gap, crouch, ( current.movementFlags & PMF_DUCKED ) != 0,
+			arc, flatVelocity.Length(), walking ? "ground" : "air" );
 	}
 
 	// the vault clock starts at the beginning of this physics step, so the first frame already moves
@@ -1551,28 +1777,28 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 	flat = ( standSpot - current.origin ) - up * vaultLedgeHeight;
 	flatDist = flat.Normalize();
 	vaultForward = flat;
-	vaultShrunk = false;
 	vaultWallContact = false;
+	vaultArc = arc;
+	// started crouched, or only room for a crouched player on top: the box stays crouch sized for
+	// the whole move (CheckDuck doesn't run while vaulting) and the camera is kept level
+	vaultCrouched = crouch || ( current.movementFlags & PMF_DUCKED );
 
 	if ( type == VAULT_LOW ) {
-		// one continuous pass at the run-up speed (or just fast enough when the run-up was slow),
-		// XY and the arc share the clock and finish together
-		float passSec, passGap;
-		LowVaultTiming( Max( 0.0f, flatVelocity * vaultForward ), vaultLedgeHeight, vaultLedgeHeight - PM_VAULT_TARGET_CLEARANCE,
-			2.0f * halfWidth + PM_VAULT_LAND_INSET, vaultMoveSpeed, passSec, passGap );
+		// one continuous pass whose duration follows takeoff speed; XY and the arc share the clock
+		// and finish together. The run-up speed comes back when the pass ends
+		const float edgeHeight = vaultLedgeHeight - PM_VAULT_TARGET_CLEARANCE;
+		const int passMsec = LowVaultTiming( flatVelocity.Length(), vaultCrouched );
+		vaultClearFrac = LowVaultClearFrac( vaultLedgeHeight, edgeHeight, vaultArc );
+		vaultApproachDist = Max( 0.0f, flatDist - ( 2.0f * halfWidth + PM_VAULT_LAND_INSET ) );
+		vaultMoveSpeed = flatDist / MS2SEC( passMsec );
 		vaultTargetPos = standSpot;
-		vaultTimer = vaultStartTime + Max( 1, SEC2MS( flatDist / vaultMoveSpeed ) );
+		vaultTimer = vaultStartTime + passMsec;
 		currentVaultState = VAULT_LOW;
 		if ( crouch ) {
-			// only room for a crouched player on top (low ceiling): duck for real, the eye goes down
-			// during the pass so the camera stays under the ceiling, and we stay crouched afterwards
+			// the pass or the landing spot only fits crouched: duck for real so the eye goes down with
+			// the box. CheckDuck stands back up after the vault if crouch isn't held and there is room
 			current.movementFlags |= PMF_DUCKED;
 			idPhysics_Player::SetClipHeight( pm_crouchheight.GetFloat() );
-		} else if ( !( current.movementFlags & PMF_DUCKED ) ) {
-			// pass with the crouch sized box so the edge can't catch it. The eye height is untouched
-			// (PMF_DUCKED is not set), the camera just follows the arc
-			idPhysics_Player::SetClipHeight( pm_crouchheight.GetFloat() );
-			vaultShrunk = true;
 		}
 	} else {
 		// the kinematic part ends with the front of the box PM_VAULT_MANTLE_OVERLAP past the edge,
@@ -1582,7 +1808,13 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 		vaultAbsorbSpeed = Max( 0.0f, flatVelocity * vaultForward );
 		vaultAbsorbMax = Max( 0.0f, wallFaceDist - halfWidth - 0.5f );
 		vaultMoveSpeed = flatVelocity.Length();
-		vaultTimer = vaultStartTime + PM_VAULT_ABSORB_MSEC;
+		// total duration by ledge height only, split between the three phases
+		const int totalMsec = VaultDuration( vaultLedgeHeight - PM_VAULT_TARGET_CLEARANCE, PM_VAULT_LOW_MAX_HEIGHT, PM_VAULT_TOP_HEIGHT,
+			PM_VAULT_HIGH_DURATION_MSEC, PM_VAULT_HIGH_DURATION_MAX_MSEC );
+		const int absorbMsec = Max( 1, idMath::Ftoi( totalMsec * PM_VAULT_ABSORB_FRAC ) );
+		vaultMantleMsec = Max( 1, idMath::Ftoi( totalMsec * PM_VAULT_MANTLE_FRAC ) );
+		vaultRiseMsec = Max( 1, totalMsec - absorbMsec - vaultMantleMsec );
+		vaultTimer = vaultStartTime + absorbMsec;
 		currentVaultState = VAULT_HIGH_GRAB;
 		if ( crouch ) {
 			// only room for a crouched player up there
@@ -1591,8 +1823,9 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 		}
 	}
 
-	// the jump press is used up by the vault
+	// the jump press is used up by the vault: latched until jump is released and the vault is over
 	vaultInputBuffer = 0;
+	vaultLatch = true;
 	current.movementFlags |= PMF_JUMP_HELD;
 	coyoteTimer = 0;
 	jumpBufferTimer = 0;
@@ -1607,23 +1840,22 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 ================
 idPhysics_Player::ProcessVault
 
-VAULT_LOW:       one continuous parabolic pass over the obstacle, XY speed never drops.
+VAULT_LOW:       one continuous parabolic pass over the obstacle, fixed duration by height.
 VAULT_HIGH_GRAB: phase 1, the hands hit the ledge and the run-up speed dies off exponentially.
 VAULT_CLIMBING:  phase 2, pull up with EaseOutCubic: fast start, soft arrival above the edge.
 VAULT_MANTLE:    phase 3, move over the edge accelerating from 0 back to the run-up speed.
-Each step is swept with the player box so it can never end up inside geometry.
+Each step is swept with the player box (VaultSweep) so it can never end up inside geometry.
 ================
 */
 void idPhysics_Player::ProcessVault( int msec ) {
-	trace_t	trace;
-	idVec3	up, oldOrigin, desired, toTarget, vertical;
+	idVec3	up, oldOrigin, desired, toTarget;
 	float	u, s, remaining;
 
 	up = -gravityNormal;
 	oldOrigin = current.origin;
 
 	// ledge jump: a fresh jump press while hanging or pulling up
-	if ( ( currentVaultState == VAULT_HIGH_GRAB || currentVaultState == VAULT_CLIMBING ) && vaultJumpPressed &&
+	if ( ( currentVaultState == VAULT_HIGH_GRAB || currentVaultState == VAULT_CLIMBING ) && vaultJumpEdge &&
 			gameLocal.time >= vaultStartTime + PM_LEDGE_JUMP_MIN_MSEC ) {
 		idPhysics_Player::EndVault( false );
 		current.velocity = up * PM_LEDGE_JUMP_SPEED + vaultForward * PM_LEDGE_JUMP_FORWARD;
@@ -1637,21 +1869,16 @@ void idPhysics_Player::ProcessVault( int msec ) {
 		vaultPhaseStartPos = current.origin;
 		if ( currentVaultState == VAULT_HIGH_GRAB ) {
 			currentVaultState = VAULT_CLIMBING;
-			vaultTimer += PM_VAULT_RISE_MSEC;
+			vaultTimer += vaultRiseMsec;
 		} else {
 			currentVaultState = VAULT_MANTLE;
-			// EaseInQuad x = D * u^2 ends at 2D / T. If the run-up was faster, shorten T so the curve
-			// ends exactly at the run-up speed; otherwise the exit speed is whatever the curve reaches
+			// EaseInQuad x = D * u^2 ends at 2D / T, which is the speed handed back at the end. T is not
+			// shortened for fast run-ups: the climb takes the same time whatever the approach was
 			toTarget = vaultTargetPos - current.origin;
 			toTarget -= ( toTarget * up ) * up;
 			const float dist = toTarget.Length();
-			int mantleMsec = PM_VAULT_MANTLE_MSEC;
-			if ( vaultMoveSpeed > 2.0f * dist / MS2SEC( mantleMsec ) ) {
-				mantleMsec = SEC2MS( 2.0f * dist / vaultMoveSpeed );
-			}
-			mantleMsec = Max( 1, mantleMsec );
-			vaultMoveSpeed = 2.0f * dist / MS2SEC( mantleMsec );
-			vaultTimer += mantleMsec;
+			vaultMoveSpeed = 2.0f * dist / MS2SEC( vaultMantleMsec );
+			vaultTimer += vaultMantleMsec;
 		}
 	}
 
@@ -1660,17 +1887,22 @@ void idPhysics_Player::ProcessVault( int msec ) {
 	switch ( currentVaultState ) {
 		case VAULT_LOW: {
 			// Z(t) = Zstart + (H + clearance) * sin( pi * t / T ) while rising, then H + clearance * sin( pi * t / T )
-			// so the peak is PM_VAULT_LOW_ARC over the edge and the pass lands on top instead of back at Zstart
+			// so the peak is vaultArc over the edge and the pass lands on top instead of back at Zstart
 			s = idMath::Sin( idMath::PI * u );
-			const float height = ( u < 0.5f ? vaultLedgeHeight * s : vaultLedgeHeight ) + PM_VAULT_LOW_ARC * s;
-			// XY moves at a constant vaultMoveSpeed, on the same clock as the arc when nothing is in the
-			// way. If the edge holds it back for a moment it just arrives a bit later, it never catches up
-			// the last step is a full one (it may end a little past the landing spot) so the exit frame
-			// is not slower than the others
-			toTarget = vaultTargetPos - current.origin;
+			const float height = ( u < 0.5f ? vaultLedgeHeight * s : vaultLedgeHeight ) + vaultArc * s;
+			// XY is on the same clock as the arc: the gap to the face is covered by the time the box
+			// clears the edge (vaultClearFrac), its own depth over the top in the rest of T, so it never
+			// stops against the obstacle and lands exactly at T whatever the start distance was
+			toTarget = vaultTargetPos - vaultStartPos;
 			toTarget -= ( toTarget * up ) * up;
-			remaining = toTarget.Normalize();
-			desired = current.origin + ( remaining > 0.01f ? toTarget : vaultForward ) * ( vaultMoveSpeed * frametime );
+			remaining = toTarget.Length();
+			float along;
+			if ( u < vaultClearFrac ) {
+				along = vaultApproachDist * ( u / vaultClearFrac );
+			} else {
+				along = vaultApproachDist + ( remaining - vaultApproachDist ) * ( ( u - vaultClearFrac ) / Max( 1.0f - vaultClearFrac, 0.001f ) );
+			}
+			desired = vaultStartPos + vaultForward * along;
 			desired += up * ( ( vaultStartPos + up * height - desired ) * up );
 			break;
 		}
@@ -1710,19 +1942,14 @@ void idPhysics_Player::ProcessVault( int msec ) {
 			return;
 	}
 
-	// sweep the box; if the step cuts the corner of the ledge, do the vertical part first
-	gameLocal.clip.Translation( trace, current.origin, desired, clipModel, clipModel->GetAxis(), clipMask, self );
-	if ( trace.fraction < 1.0f ) {
-		vertical = current.origin + up * ( ( desired - current.origin ) * up );
-		gameLocal.clip.Translation( trace, current.origin, vertical, clipModel, clipModel->GetAxis(), clipMask, self );
-		if ( currentVaultState == VAULT_HIGH_GRAB || currentVaultState == VAULT_CLIMBING ) {
-			// the hands are on the wall: drop the rest of the horizontal move instead of catching up later
-			vaultWallContact = true;
-		}
+	// sweep the box there
+	const bool onWall = ( currentVaultState == VAULT_HIGH_GRAB || currentVaultState == VAULT_CLIMBING );
+	if ( idPhysics_Player::VaultSweep( desired ) && onWall ) {
+		// the hands are on the wall: drop the rest of the horizontal move instead of catching up later
+		vaultWallContact = true;
 	}
 
-	current.origin = trace.endpos;
-	current.localOrigin = trace.endpos;
+	current.localOrigin = current.origin;
 	clipModel->Link( gameLocal.clip, self, 0, current.origin, clipModel->GetAxis() );
 
 	// kinematic velocity, keeps view bob / crash land / network code sane
@@ -1745,6 +1972,85 @@ void idPhysics_Player::ProcessVault( int msec ) {
 
 /*
 ================
+idPhysics_Player::NudgeOutOfSolid
+
+Overlapping brushes (imperfect map geometry) can make the box test as overlapping solid at a spot
+it reached with regular, swept movement. Instead of treating that as stuck, push it back along away
+(out of the obstacle face) by up to PM_VAULT_NUDGE_MAX, to the first spot where it is clean.
+Returns false if there is no such spot: the box is really stuck and nothing is moved.
+================
+*/
+bool idPhysics_Player::NudgeOutOfSolid( const idVec3 &away ) {
+	if ( !( gameLocal.clip.Contents( current.origin, clipModel, clipModel->GetAxis(), clipMask, self ) & clipMask ) ) {
+		return true;
+	}
+	for ( float d = 0.5f; d <= PM_VAULT_NUDGE_MAX; d += 0.5f ) {
+		const idVec3 pos = current.origin + away * d;
+		if ( !( gameLocal.clip.Contents( pos, clipModel, clipModel->GetAxis(), clipMask, self ) & clipMask ) ) {
+			current.origin = pos;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+================
+idPhysics_Player::VaultSweep
+
+Moves the box towards desired in substeps of at most PM_VAULT_SWEEP_STEP, each one swept with the
+real clip model (continuous collision), so a fast frame can't cut a corner and the box never ends
+up inside solid geometry. A blocked substep keeps the vertical part first (up and over the edge),
+then whatever horizontal part still fits along the planned direction. Nothing is ever deflected
+sideways: what doesn't fit is dropped, never forced or slid. Returns true if anything blocked.
+================
+*/
+bool idPhysics_Player::VaultSweep( const idVec3 &desired ) {
+	trace_t	trace;
+	idVec3	up, start, step, target, horizontal;
+	bool	blocked;
+	int		i, numSteps;
+
+	up = -gravityNormal;
+
+	// a seam of overlapping brushes would make every sweep start "in solid" and freeze the vault
+	idPhysics_Player::NudgeOutOfSolid( -vaultForward );
+
+	start = current.origin;
+	numSteps = Max( 1, idMath::Ftoi( idMath::Ceil( ( desired - start ).Length() / PM_VAULT_SWEEP_STEP ) ) );
+	step = ( desired - start ) / (float)numSteps;
+	blocked = false;
+
+	for ( i = 1; i <= numSteps; i++ ) {
+		// targets stay on the planned path, a substep that was held back catches up with the next ones
+		target = start + step * (float)i;
+
+		gameLocal.clip.Translation( trace, current.origin, target, clipModel, clipModel->GetAxis(), clipMask, self );
+		if ( trace.fraction >= 1.0f ) {
+			current.origin = trace.endpos;
+			continue;
+		}
+		blocked = true;
+
+		// vertical part first
+		gameLocal.clip.Translation( trace, current.origin, current.origin + up * ( ( target - current.origin ) * up ), clipModel, clipModel->GetAxis(), clipMask, self );
+		current.origin = trace.endpos;
+
+		// then the horizontal part from there
+		horizontal = target - current.origin;
+		horizontal -= ( horizontal * up ) * up;
+		if ( horizontal.LengthSqr() < Square( 0.01f ) ) {
+			continue;
+		}
+		gameLocal.clip.Translation( trace, current.origin, current.origin + horizontal, clipModel, clipModel->GetAxis(), clipMask, self );
+		current.origin = trace.endpos;
+	}
+
+	return blocked;
+}
+
+/*
+================
 idPhysics_Player::EndVault
 ================
 */
@@ -1759,16 +2065,6 @@ void idPhysics_Player::EndVault( const bool keepMomentum ) {
 	vaultLatch = true;
 	vaultInputBuffer = 0;
 	jumpBufferTimer = 0;
-
-	if ( vaultShrunk ) {
-		// grow back to standing height if there is room, otherwise stay crouched
-		vaultShrunk = false;
-		if ( idPhysics_Player::HasHeadroom() ) {
-			idPhysics_Player::SetClipHeight( pm_normalheight.GetFloat() );
-		} else {
-			current.movementFlags |= PMF_DUCKED;
-		}
-	}
 
 	if ( keepMomentum ) {
 		if ( vaultType == VAULT_LOW ) {
@@ -1793,6 +2089,23 @@ float idPhysics_Player::GetVaultProgress( void ) const {
 		return 0.0f;
 	}
 	return idMath::ClampFloat( 0.0f, 1.0f, ( gameLocal.time - vaultPhaseStartTime ) / (float)( vaultTimer - vaultPhaseStartTime ) );
+}
+
+/*
+================
+idPhysics_Player::GetVaultDurationMsec
+
+Total duration of the current or most recently completed vault.
+================
+*/
+int idPhysics_Player::GetVaultDurationMsec( void ) const {
+	int duration = vaultTimer - vaultStartTime;
+	if ( vaultType == VAULT_HIGH_GRAB && currentVaultState == VAULT_HIGH_GRAB ) {
+		duration += vaultRiseMsec + vaultMantleMsec;
+	} else if ( vaultType == VAULT_HIGH_GRAB && currentVaultState == VAULT_CLIMBING ) {
+		duration += vaultMantleMsec;
+	}
+	return Max( 0, duration );
 }
 
 /*
@@ -1963,10 +2276,8 @@ bool idPhysics_Player::CheckJump( void ) {
 		return false;
 	}
 
-	// don't jump if we can't stand up
-	if ( current.movementFlags & PMF_DUCKED ) {
-		return false;
-	}
+	// still crouched here (latched crouch, or no room to stand): a crouch jump. The box stays crouch
+	// sized for the whole jump, CheckDuck only stands it up when the crouch is let go and it fits
 
 	// consume the assists so a single press can't jump twice
 	coyoteTimer = 0;
@@ -2144,18 +2455,23 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		current.movementFlags &= ~PMF_JUMP_HELD;
 	}
 
-	// after a vault nothing jumps again until jump is fully released
-	if ( command.upmove < 10 ) {
+	// the press that started a vault is used up: nothing jumps or vaults again (holding space doesn't
+	// re-trigger anything every frame) until jump is fully released AND the vault is over
+	if ( command.upmove < 10 && currentVaultState == VAULT_NONE ) {
 		vaultLatch = false;
 	}
 
-	// vaults start from a fresh jump press, remembered for PM_VAULT_INPUT_BUFFER_MSEC. In the air,
-	// keeping jump held also keeps it alive, so jump + hold grabs a ledge that comes in range mid-air
-	vaultJumpPressed = ( command.upmove >= 10 ) && !vaultJumpDown && !vaultLatch;
+	// vaults start from a jump press, remembered for PM_VAULT_INPUT_BUFFER_MSEC so the timing doesn't have
+	// to be exact. Keeping jump held in the air renews that window while rising and around the apex, so
+	// jump + hold climbs onto a ledge or into a duct that comes in range mid-air; once falling it runs out.
+	// Holding jump on the ground never renews it, and after a vault the latch blocks everything until jump
+	// is released. A ledge jump only needs a fresh edge: during the vault that means jump was released
+	vaultJumpEdge = ( command.upmove >= 10 ) && !vaultJumpDown;
+	vaultJumpPressed = vaultJumpEdge && !vaultLatch;
 	vaultJumpDown = ( command.upmove >= 10 );
 	if ( vaultLatch ) {
 		current.movementFlags |= PMF_JUMP_HELD;
-	} else if ( vaultJumpPressed || ( vaultJumpDown && !wasWalking ) ) {
+	} else if ( vaultJumpPressed || ( vaultJumpDown && !wasWalking && ( current.velocity * -gravityNormal ) > PM_VAULT_HOLD_MIN_UPSPEED ) ) {
 		vaultInputBuffer = gameLocal.time + PM_VAULT_INPUT_BUFFER_MSEC;
 	}
 
@@ -2226,9 +2542,6 @@ void idPhysics_Player::MovePlayer( int msec ) {
 	}
 	idPhysics_Player::CheckSlideStart();
 
-	// set clip model size
-	idPhysics_Player::CheckDuck();
-
 	// handle timers
 	idPhysics_Player::DropTimers();
 
@@ -2240,13 +2553,17 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		idPhysics_Player::UpdateJumpAssists();
 	}
 
-	// jump at an obstacle: vault / ledge grab instead of the regular move
+	// jump at an obstacle: vault / ledge grab instead of the regular move. This runs before CheckDuck:
+	// the jump press would otherwise stand a crouched player up first, now the vault starts crouched
 	if ( idPhysics_Player::CheckVaultStart() ) {
 		idPhysics_Player::ProcessVault( msec );
 		current.velocity += current.pushVelocity;
 		current.pushVelocity.Zero();
 		return;
 	}
+
+	// set clip model size
+	idPhysics_Player::CheckDuck();
 
 	// move
 	if ( current.movementType == PM_DEAD ) {
@@ -2394,7 +2711,10 @@ idPhysics_Player::idPhysics_Player( void ) {
 	vaultInputBuffer = 0;
 	vaultJumpDown = false;
 	vaultJumpPressed = false;
+	vaultJumpEdge = false;
 	vaultLatch = false;
+	crouchLatched = false;
+	duckOriginShift = 0.0f;
 	vaultStartTime = 0;
 	vaultPhaseStartTime = 0;
 	vaultTimer = 0;
@@ -2409,8 +2729,13 @@ idPhysics_Player::idPhysics_Player( void ) {
 	vaultMoveSpeed = 0.0f;
 	vaultAbsorbSpeed = 0.0f;
 	vaultAbsorbMax = 0.0f;
-	vaultShrunk = false;
+	vaultClearFrac = 0.0f;
+	vaultApproachDist = 0.0f;
+	vaultRiseMsec = 0;
+	vaultMantleMsec = 0;
 	vaultWallContact = false;
+	vaultCrouched = false;
+	vaultArc = PM_VAULT_LOW_ARC;
 	waterLevel = WATERLEVEL_NONE;
 	waterType = 0;
 }

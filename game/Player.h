@@ -91,6 +91,26 @@ const float LEAN_MAX_OFFSET = 28.0f;	// lateral camera offset at full lean, in w
 const float LEAN_MAX_ROLL = 8.0f;		// head roll at full lean, in degrees
 const float LEAN_SPEED = 5.0f;			// leanAmount change per second (0.2s to fully lean)
 
+// skills unlocked with "give_skill <name>", kept across levels and in savegames. Savegames from before
+// this internal savegame version (idGameLocal::INTERNAL_SAVEGAME_VERSION) don't have them and still load
+const int PLAYER_SAVEGAME_SKILLS = 2;
+
+// blink (prototype: aiming only), bound with "bind MOUSE2 _button7" (BUTTON_7 is the last free usercmd bit)
+const int BUTTON_BLINK = BUTTON_7;
+const float BLINK_MAX_DISTANCE = 1200.0f;		// reach of the aiming trace
+const float BLINK_WALL_MAX_SLOPE = 0.3f;		// |normal . up| below this: a wall that may have a ledge on top
+const float BLINK_LEDGE_MIN_NORMAL = 0.7f;		// the top of the ledge must be walkable
+const float BLINK_LEDGE_INSET = 6.0f;			// the back of the box lands this far in past the edge, clear of the lip / duct frame
+const float BLINK_LEDGE_CLEARANCE = 1.0f;		// and this far above the top
+const float BLINK_LEDGE_REACH = 96.0f;			// how far above the hit the top of a wall / mouth of a duct is searched for
+const float BLINK_LEDGE_STEP = 6.0f;			// height step of that search
+const float BLINK_FIT_MARGIN = 1.0f;			// room the box must have on the sides and above at the destination
+const float BLINK_RETRY_STEP = 4.0f;			// a spot that doesn't fit is retried this much further in (ledge) or back (floor / wall)
+const float BLINK_SIDE_PROBE = 64.0f;			// side walls closer than this are looked for to push the box off them
+const float BLINK_DEBUG_BOX_SIZE = 4.0f;		// half size of the debug box drawn at the hit point
+const float BLINK_SURFACE_GAP = 1.0f;			// the box is placed this far off the surface that was hit
+const float BLINK_DROP_DISTANCE = 512.0f;		// from there it is swept down this far looking for the floor (mid-air if none)
+
 // crouch & slide camera
 const int CROUCH_VIEW_TRANSITION_MSEC = 180;	// eye height change between standing and crouching
 const float SLIDE_VIEW_DIP = 2.5f;			// extra camera drop while sliding, in world units
@@ -103,12 +123,18 @@ const float VAULT_VIEW_LOW_PITCH = 2.5f;		// low vault: inertia kick, looks up t
 const float VAULT_VIEW_LOW_PITCH_PEAK = 0.3f;	// low vault: fraction of the pass where that kick peaks, then eases back
 const float VAULT_VIEW_LOW_ROLL = 3.0f;		// low vault: shoulder wobble, one side then the other
 const float VAULT_VIEW_LAND_PITCH = 1.5f;		// landing on top of the obstacle: short downward nod
-const int VAULT_VIEW_LAND_MSEC = 150;			// duration of that nod
-const float VAULT_VIEW_ORIGIN_RATE = 25.0f;	// ease rate of the camera height during and right after a vault (eases in and out)
+const int VAULT_VIEW_LAND_MSEC = 200;			// duration of that nod (the longer vaults need a softer settle)
+const float VAULT_VIEW_ORIGIN_RATE = 16.0f;	// ease rate of the camera height during and right after a vault (eases in and out, ~60 ms lag)
 const float VAULT_VIEW_GRAB_PITCH = 2.5f;		// ledge grab: looks down when the hands hit, back to level while pulling up
 const float VAULT_VIEW_HIGH_ROLL = 3.0f;		// ledge grab at an angle to the wall: shoulder roll
 const float VAULT_VIEW_YAW_ALIGN = 4.0f;		// ledge grab phase 1: the view turns at most this much to face the wall
 const float VAULT_VIEW_BLEND_RATE = 14.0f;	// how fast the camera settles if a vault is cut short (ledge jump, teleport)
+
+// half size of the box swept from the body to the final camera position (idPlayerView::ClampCameraToWorld).
+// It grows with the fov to always contain the near clip plane, so that can't poke through walls either
+const float CAMERA_CLAMP_SIZE = 6.0f;		// minimum, also the margin the vault camera keeps from the top / bottom of the box
+const float CAMERA_CLAMP_MARGIN = 0.5f;		// on top of the near plane corner distance
+const float CAMERA_CLAMP_MAX_SIZE = 12.0f;	// must fit around the middle of the crouched box (38 high, 32 wide)
 
 typedef enum {
 	LEAN_NONE,
@@ -261,6 +287,8 @@ public:
 
 	bool					noclip;
 	bool					godmode;
+
+	bool					hasBlinkSkill;		// blink unlocked ("give_skill blink"), saved and kept across levels
 
 	bool					spawnAnglesSet;		// on first usercmd, we must set deltaAngles
 	idAngles				spawnAngles;
@@ -455,9 +483,18 @@ public:
 
 	bool					IsSliding( void ) const { return physicsObj.IsSliding(); }
 	bool					CanUncrouch( void ) const { return physicsObj.CanUncrouch(); }
+	void					UpdateCrouchInput( void );
 	void					UpdateCrouchState( int msec );
 	float					GetSlideViewBlend( void ) const { return slideViewBlend; }
 	float					GetSlideViewRoll( void ) const { return slideViewRoll; }
+
+	void					UpdateBlink( void );
+	bool					CanBlink( void ) const;
+	void					UpdateBlinkTarget( void );
+	bool					FindBlinkLedge( const trace_t &hit, idVec3 &outSpot, bool &outCrouched ) const;
+	bool					FindBlinkSpot( const trace_t &hit, const idVec3 &forward, idVec3 &outSpot, bool &outCrouched ) const;
+	bool					FitBlinkLedgeSpot( const idVec3 &spot, const idVec3 &normal, const idVec3 &facePoint, idVec3 &outSpot, bool &outCrouched ) const;
+	idVec3					PushBlinkSpotOffWalls( const idVec3 &spot, const idVec3 &side, float height ) const;
 
 	bool					IsVaulting( void ) const { return physicsObj.IsVaulting(); }
 	vaultState_t			GetVaultState( void ) const { return physicsObj.GetVaultState(); }
@@ -601,6 +638,18 @@ private:
 	int						viewHeightChangeTime;
 	float					slideViewBlend;		// 0..1, eases the slide camera bias in and out
 	float					slideViewRoll;		// eased roll from steering during a slide
+	bool					crouchToggled;		// pm_toggleCrouch: crouch is latched on
+	bool					crouchKeyDown;		// crouch key was down last frame, to detect a fresh press
+	bool					crouchSuppressed;	// sprint to stand: the held crouch key is ignored until released
+	bool					sprintRequestDown;	// run + forward last frame, to detect a fresh sprint request
+	bool					sprintStandPending;	// sprint asked for while crouched, stands up once there is room
+	bool					aimingBlink;		// blink button held: the target is traced and drawn every frame (not saved)
+	idVec3					blinkTargetOrigin;	// where the blink would put the player (origin, feet)
+	bool					blinkCanVaultLedge;	// the target is on top of a ledge the player box fits on
+	bool					blinkTargetValid;	// the player box fits at blinkTargetOrigin
+	bool					blinkTargetCrouched;	// ...but only crouched
+	bool					blinkCancelled;		// aiming was cut off (flashlight put away...): nothing until the button is released
+	int						weapon_flashlight;	// inventory slot of the flashlight, blink needs it in hand (not saved, looked up again)
 	float					vaultViewPitch;		// eased pitch impulse of the vault
 	float					vaultViewRoll;		// eased shoulder roll of the vault
 	bool					vaultYawStarted;	// yaw alignment of the current ledge grab was set up

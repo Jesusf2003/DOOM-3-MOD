@@ -475,6 +475,65 @@ void idPlayerView::CalculatePlayerView( idVec3 &origin, idAngles &angles ) const
 
 /*
 ==================
+idPlayerView::ClampCameraToWorld
+
+Sweeps a box from the middle of the player box, which is always in free space, to the final camera
+position, against everything the body itself collides with (player clip included). If it hits
+anything the camera stops there: view offsets (bob, lean, slide dip, vault easing, nodal offset)
+can bring it close to walls and ceilings but never through them.
+The box is sized from the near clip plane at the current fov: with a wide (widescreen, sprint)
+fov the corners of that plane are further from the camera than a fixed small box would cover,
+and they'd poke through the surface the camera was clamped against.
+==================
+*/
+void idPlayerView::ClampCameraToWorld( idVec3 &origin ) const {
+	trace_t tr;
+
+	if ( player == NULL || player->noclip || player->spectating ) {
+		return;
+	}
+
+	const idPhysics *physics = player->GetPhysics();
+	const idBounds &box = physics->GetBounds();
+	const idVec3 start = physics->GetOrigin() - physics->GetGravityNormal() * ( ( box[0][2] + box[1][2] ) * 0.5f );
+	const float radius = CameraClipRadius();
+	const idBounds cameraBounds( idVec3( -radius, -radius, -radius ), idVec3( radius, radius, radius ) );
+
+	gameLocal.clip.TraceBounds( tr, start, origin, cameraBounds, ( physics->GetClipMask() | MASK_SOLID ) & ~CONTENTS_BODY, player );
+	if ( tr.fraction <= 0.0f ) {
+		// already blocked at the start (body stuck in a mover): nothing sensible to clamp to
+		return;
+	}
+	if ( tr.fraction < 1.0f ) {
+		origin = tr.endpos;
+	}
+}
+
+/*
+==================
+idPlayerView::CameraClipRadius
+
+Distance from the camera to the farthest corner of the near clip plane, so a box of this half size
+around the camera contains the whole plane in any orientation. Uses the fov of the last rendered
+frame (the sprint fov eases, so it is never far off) plus a small margin.
+==================
+*/
+float idPlayerView::CameraClipRadius( void ) const {
+	float radius = CAMERA_CLAMP_SIZE;
+
+	const renderView_t *view = ( player != NULL ) ? player->GetRenderView() : NULL;
+	if ( view != NULL && view->fov_x > 0.0f && view->fov_y > 0.0f ) {
+		const float tanX = idMath::Tan( DEG2RAD( Min( view->fov_x, 170.0f ) * 0.5f ) );
+		const float tanY = idMath::Tan( DEG2RAD( Min( view->fov_y, 170.0f ) * 0.5f ) );
+		const float zNear = cvarSystem->GetCVarFloat( "r_znear" );
+		radius = Max( radius, zNear * idMath::Sqrt( 1.0f + tanX * tanX + tanY * tanY ) + CAMERA_CLAMP_MARGIN );
+	}
+	// the box starts in the middle of the crouched player box, it has to fit in there
+	return Min( radius, CAMERA_CLAMP_MAX_SIZE );
+}
+
+/*
+==================
 idPlayerView::UpdateSprintFov
 
 Eases the sprint fov in and out. The boost is kept during a sprint jump as long as the

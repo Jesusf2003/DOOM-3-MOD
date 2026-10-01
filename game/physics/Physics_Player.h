@@ -118,12 +118,16 @@ public:
 	int						GetSlideTimer( void ) const { return slideTimer; }
 	const idVec3 &			GetSlideDir( void ) const { return slideDir; }
 	bool					CanUncrouch( void ) const;
+	void					SetCrouchLatched( const bool latched ) { crouchLatched = latched; }
+	float					ConsumeDuckOriginShift( void );	// origin moved up by an air crouch / stand since the last call
 							// vault / ledge grab
 	vaultState_t			GetVaultState( void ) const { return currentVaultState; }
 	bool					IsVaulting( void ) const { return currentVaultState != VAULT_NONE; }
 	float					GetVaultProgress( void ) const;	// progress of the current phase
+	int						GetVaultDurationMsec( void ) const;	// total duration, retained after completion for camera settling
 	const idVec3 &			GetVaultLedgeNormal( void ) const { return vaultLedgeNormal; }
-	bool					CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch = NULL, float probeDist = 40.0f, float *outWallDist = NULL );
+	bool					IsVaultCrouched( void ) const { return vaultCrouched; }	// current or last vault was done crouched
+	bool					CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch = NULL, float probeDist = 40.0f, float *outWallDist = NULL, float *outArc = NULL );
 
 public:	// common physics interface
 	bool					Evaluate( int timeStepMSec, int endTimeMSec );
@@ -196,6 +200,8 @@ private:
 
 	// crouch & slide (not saved: a slide only lasts a fraction of a second)
 	bool					isSprinting;			// fed by idPlayer every frame, slides can only start from a sprint
+	bool					crouchLatched;			// fed by idPlayer every frame: pm_toggleCrouch keeps the crouch on, even while jumping
+	float					duckOriginShift;		// origin moved up by crouching / standing up in the air, read by idPlayer for the eye
 	bool					crouchHeld;				// crouch was held last frame, to detect a fresh press
 	bool					isSliding;
 	int						slideTimer;				// the slide ends at this time unless a downhill slope keeps it alive
@@ -207,8 +213,9 @@ private:
 	vaultState_t			vaultType;				// VAULT_LOW or VAULT_HIGH_GRAB, chosen when the vault starts
 	int						vaultInputBuffer;		// a fresh jump press can start a vault until this time
 	bool					vaultJumpDown;			// jump was down last frame
-	bool					vaultJumpPressed;		// fresh jump press this frame
-	bool					vaultLatch;				// set when a vault ends: no jump or vault until jump is released
+	bool					vaultJumpPressed;		// fresh jump press this frame that may start a vault (not latched)
+	bool					vaultJumpEdge;			// jump went down this frame, latch or not (ledge jump)
+	bool					vaultLatch;				// set when a vault starts: no jump or vault until jump is released and the vault is over
 	int						vaultStartTime;
 	int						vaultPhaseStartTime;	// start of the current phase
 	int						vaultTimer;				// end of the current phase
@@ -223,8 +230,13 @@ private:
 	float					vaultMoveSpeed;			// low: speed of the pass. ledge grab: speed handed back at the end
 	float					vaultAbsorbSpeed;		// ledge grab phase 1: speed towards the wall being absorbed
 	float					vaultAbsorbMax;			// ledge grab phase 1: distance left until the box touches the wall
-	bool					vaultShrunk;			// low vault: the box was shrunk to crouch height for the pass
+	float					vaultClearFrac;			// low vault: fraction of T after which the box is above the edge
+	float					vaultApproachDist;		// low vault: horizontal distance covered before that (gap to the face)
+	int						vaultRiseMsec;			// ledge grab: duration of phase 2
+	int						vaultMantleMsec;		// ledge grab: duration of phase 3
 	bool					vaultWallContact;		// ledge grab: the box touched the wall, no more horizontal move until phase 3
+	bool					vaultCrouched;			// started crouched (or only room for a crouched player on top): crouch sized box all the way
+	float					vaultArc;				// low vault: how far above the edge the pass peaks (flatter in tight spaces)
 	idVec3					slideDir;				// horizontal direction locked when the slide started
 
 	// results of last evaluate
@@ -255,8 +267,14 @@ private:
 	void					EndSlide( void );
 	idBounds				PlayerBounds( const bool crouched ) const;
 	bool					HasHeadroom( void ) const;
+	bool					HasFootroom( void ) const;
+	bool					IsAirborne( void ) const;
+	void					TuckLegs( void );
+	bool					StandUpInAir( void );
 	bool					CheckVaultStart( void );
 	void					ProcessVault( int msec );
+	bool					VaultSweep( const idVec3 &desired );
+	bool					NudgeOutOfSolid( const idVec3 &away );
 	void					EndVault( const bool keepMomentum );
 	void					ProcessSlide( int msec );
 	void					SetClipHeight( const float maxZ );

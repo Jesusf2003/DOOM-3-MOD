@@ -76,6 +76,8 @@ public:
 
 						// procedural first person camera (lean offset + head roll)
 	void				CalculatePlayerView( idVec3 &origin, idAngles &angles ) const;
+	void				ClampCameraToWorld( idVec3 &origin ) const;
+	float				CameraClipRadius( void ) const;
 						// sprint fov, updated once per game frame
 	void				UpdateSprintFov( int msec );
 	float				GetSprintFovOffset( void ) const { return sprintFovOffset; }

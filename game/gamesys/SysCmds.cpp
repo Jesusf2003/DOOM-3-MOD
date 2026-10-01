@@ -377,6 +377,33 @@ void Cmd_Give_f( const idCmdArgs &args ) {
 
 /*
 ==================
+Cmd_GiveSkill_f
+
+Unlocks a skill for the local player: give_skill <skillname>
+==================
+*/
+void Cmd_GiveSkill_f( const idCmdArgs &args ) {
+	idPlayer *player = gameLocal.GetLocalPlayer();
+	if ( !player || !gameLocal.CheatsOk() ) {
+		return;
+	}
+
+	if ( args.Argc() < 2 ) {
+		gameLocal.Printf( "usage: give_skill <skillname>\nskills: blink\n" );
+		return;
+	}
+
+	const char *skillName = args.Argv( 1 );
+	if ( idStr::Icmp( skillName, "blink" ) == 0 ) {
+		player->hasBlinkSkill = true;
+		gameLocal.Printf( "Skill unlocked: Blink\n" );
+	} else {
+		gameLocal.Printf( "Unknown skill: %s\n", skillName );
+	}
+}
+
+/*
+==================
 Cmd_CenterView_f
 
 Centers the players pitch
@@ -2319,6 +2346,7 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "addChatLine",			Cmd_AddChatLine_f,			CMD_FL_GAME,				"internal use - core to game chat lines" );
 	cmdSystem->AddCommand( "gameKick",				Cmd_Kick_f,					CMD_FL_GAME,				"same as kick, but recognizes player names" );
 	cmdSystem->AddCommand( "give",					Cmd_Give_f,					CMD_FL_GAME|CMD_FL_CHEAT,	"gives one or more items" );
+	cmdSystem->AddCommand( "give_skill",			Cmd_GiveSkill_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"unlocks a skill: give_skill blink" );
 	cmdSystem->AddCommand( "centerview",			Cmd_CenterView_f,			CMD_FL_GAME,				"centers the view" );
 	cmdSystem->AddCommand( "god",					Cmd_God_f,					CMD_FL_GAME|CMD_FL_CHEAT,	"enables god mode" );
 	cmdSystem->AddCommand( "notarget",				Cmd_Notarget_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"disables the player as a target" );

@@ -73,6 +73,11 @@ const int HEALTHPULSE_TIME = 333;
 // minimum speed to bob and play run/walk animations at
 const float MIN_BOB_SPEED = 5.0f;
 
+// the engine's own in_toggleCrouch makes the crouch key sticky inside the usercmd, where crouch and
+// jump cancel out (upmove = 0), so a toggled crouch could never jump or vault. This one is done here
+// on top of a plain held key and keeps jump usable; leave in_toggleCrouch at 0 when using it
+idCVar pm_toggleCrouch( "pm_toggleCrouch", "0", CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "0 = hold the crouch key to stay crouched, 1 = a press toggles crouching / standing (needs in_toggleCrouch 0)" );
+
 const idEventDef EV_Player_GetButtons( "getButtons", NULL, 'd' );
 const idEventDef EV_Player_GetMove( "getMove", NULL, 'v' );
 const idEventDef EV_Player_GetViewAngles( "getViewAngles", NULL, 'v' );
@@ -981,6 +986,19 @@ idPlayer::idPlayer() {
 	viewHeightChangeTime	= 0;
 	slideViewBlend			= 0.0f;
 	slideViewRoll			= 0.0f;
+	crouchToggled			= false;
+	crouchKeyDown			= false;
+	crouchSuppressed		= false;
+	sprintRequestDown		= false;
+	sprintStandPending		= false;
+	aimingBlink				= false;
+	blinkTargetOrigin.Zero();
+	blinkCanVaultLedge		= false;
+	blinkTargetValid		= false;
+	blinkTargetCrouched		= false;
+	blinkCancelled			= false;
+	weapon_flashlight		= -1;
+	hasBlinkSkill			= false;
 	vaultViewPitch			= 0.0f;
 	vaultViewRoll			= 0.0f;
 	vaultYawStarted			= false;
@@ -1237,6 +1255,7 @@ void idPlayer::Init( void ) {
 	weapon_soulcube			= SlotForWeapon( "weapon_soulcube" );
 	weapon_pda				= SlotForWeapon( "weapon_pda" );
 	weapon_fists			= SlotForWeapon( "weapon_fists" );
+	weapon_flashlight		= SlotForWeapon( "weapon_flashlight" );
 	showWeaponViewModel		= GetUserInfo()->GetBool( "ui_showGun" );
 
 
@@ -1339,6 +1358,17 @@ void idPlayer::Init( void ) {
 	viewHeightChangeTime = 0;
 	slideViewBlend = 0.0f;
 	slideViewRoll = 0.0f;
+	crouchToggled = false;
+	crouchKeyDown = false;
+	crouchSuppressed = false;
+	sprintRequestDown = false;
+	sprintStandPending = false;
+	aimingBlink = false;
+	blinkTargetOrigin.Zero();
+	blinkCanVaultLedge = false;
+	blinkTargetValid = false;
+	blinkTargetCrouched = false;
+	blinkCancelled = false;
 	vaultViewPitch = 0.0f;
 	vaultViewRoll = 0.0f;
 	vaultYawStarted = false;
@@ -1855,6 +1885,9 @@ void idPlayer::Save( idSaveGame *savefile ) const {
 
 	savefile->WriteFloat( pm_stamina.GetFloat() );
 
+	// PLAYER_SAVEGAME_SKILLS
+	savefile->WriteBool( hasBlinkSkill );
+
 	if ( hud ) {
 		hud->SetStateString( "message", common->GetLanguageDict()->GetString( "#str_02916" ) );
 		hud->HandleNamedEvent( "Message" );
@@ -2105,6 +2138,13 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	savefile->ReadFloat( set );
 	pm_stamina.SetFloat( set );
 
+	// skills, savegames from before they existed start without any
+	if ( savefile->GetInternalSavegameVersion() >= PLAYER_SAVEGAME_SKILLS ) {
+		savefile->ReadBool( hasBlinkSkill );
+	} else {
+		hasBlinkSkill = false;
+	}
+
 	// create combat collision hull for exact collision detection
 	SetCombatModel();
 
@@ -2113,6 +2153,20 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	viewHeightChangeTime = 0;
 	slideViewBlend = 0.0f;
 	slideViewRoll = 0.0f;
+	// a toggled crouch is not saved: keep crouching if the save was made crouched
+	crouchToggled = physicsObj.IsCrouching();
+	crouchKeyDown = false;
+	crouchSuppressed = false;
+	sprintRequestDown = false;
+	sprintStandPending = false;
+	aimingBlink = false;
+	blinkTargetOrigin.Zero();
+	blinkCanVaultLedge = false;
+	blinkTargetValid = false;
+	blinkTargetCrouched = false;
+	blinkCancelled = false;
+	// not saved, so old savegames keep loading
+	weapon_flashlight = SlotForWeapon( "weapon_flashlight" );
 	vaultViewPitch = 0.0f;
 	vaultViewRoll = 0.0f;
 	vaultYawStarted = false;
@@ -2362,6 +2416,7 @@ void idPlayer::SavePersistantInfo( void ) {
 	inventory.GetPersistantData( playerInfo );
 	playerInfo.SetInt( "health", health );
 	playerInfo.SetInt( "current_weapon", currentWeapon );
+	playerInfo.SetBool( "skill_blink", hasBlinkSkill );
 }
 
 /*
@@ -2383,6 +2438,8 @@ void idPlayer::RestorePersistantInfo( void ) {
 	if ( !gameLocal.isClient ) {
 		idealWeapon = spawnArgs.GetInt( "current_weapon", "1" );
 	}
+	// skills: unlocked on an earlier level, or given to the player by the map ("skill_blink" "1")
+	hasBlinkSkill = spawnArgs.GetBool( "skill_blink", "0" );
 }
 
 /*
@@ -5933,8 +5990,9 @@ bool idPlayer::CheckLeanCollision( float offset ) {
 		return false;
 	}
 
-	// a small box instead of a point, so the near clip plane of the camera can't poke through walls
-	const idBounds cameraBounds( idVec3( -5.0f, -5.0f, -5.0f ), idVec3( 5.0f, 5.0f, 5.0f ) );
+	// a box instead of a point, sized so the near clip plane of the camera can't poke through walls
+	const float radius = playerView.CameraClipRadius();
+	const idBounds cameraBounds( idVec3( -radius, -radius, -radius ), idVec3( radius, radius, radius ) );
 
 	start = GetEyePosition();
 	end = start + GetLeanRightVector() * offset;
@@ -5944,6 +6002,450 @@ bool idPlayer::CheckLeanCollision( float offset ) {
 	leanOffset = offset * tr.fraction;
 
 	return ( tr.fraction < 1.0f );
+}
+
+/*
+==============
+BlinkBoxFits
+
+Position test: is the player box free of solids at this spot?
+==============
+*/
+static bool BlinkBoxFits( const idVec3 &pos, const idBounds &bounds, int mask, const idEntity *pass ) {
+	const idTraceModel trm( bounds );
+	idClipModel box( trm );
+
+	return ( gameLocal.clip.Contents( pos, &box, mat3_identity, mask, pass ) & mask ) == 0;
+}
+
+/*
+==============
+BlinkBoundsWithMargin
+
+The box grown by BLINK_FIT_MARGIN on the sides and above, not below: it stands on the floor.
+==============
+*/
+static idBounds BlinkBoundsWithMargin( const idBounds &bounds ) {
+	idBounds b = bounds;
+	b[0][0] -= BLINK_FIT_MARGIN;
+	b[0][1] -= BLINK_FIT_MARGIN;
+	b[1] += idVec3( BLINK_FIT_MARGIN, BLINK_FIT_MARGIN, BLINK_FIT_MARGIN );
+	return b;
+}
+
+/*
+==============
+idPlayer::CanBlink
+
+The blink must have been unlocked (give_skill blink), and it is cast with the flashlight: it must be
+the current weapon, fully raised and not about to be switched away (no raising, lowering, holstering
+or pending weapon change). Without the skill BUTTON_BLINK does nothing.
+==============
+*/
+bool idPlayer::CanBlink( void ) const {
+	if ( !hasBlinkSkill ) {
+		return false;
+	}
+	if ( health <= 0 || spectating || noclip || gameLocal.inCinematic || objectiveSystemOpen || influenceActive ||
+		privateCameraView || entityNumber != gameLocal.localClientNum ) {
+		return false;
+	}
+	if ( weapon_flashlight < 0 || currentWeapon != weapon_flashlight || idealWeapon != weapon_flashlight || !weaponEnabled ) {
+		return false;
+	}
+	const idWeapon *flashlight = weapon.GetEntity();
+	return flashlight != NULL && flashlight->IsReady();
+}
+
+/*
+==============
+idPlayer::UpdateBlink
+
+Hold BUTTON_BLINK with the flashlight in hand to aim: the target is traced and drawn every frame.
+Releasing it ends the aim and, for now, only prints where the blink would have taken the player.
+If the flashlight stops being usable while aiming (switched, put away, dead...) the aim is cancelled
+on the spot: nothing is drawn any more (debug lines only last one frame), nothing is printed on
+release, and nothing starts again until the button is released.
+==============
+*/
+void idPlayer::UpdateBlink( void ) {
+	const bool held = ( usercmd.buttons & BUTTON_BLINK ) != 0;
+
+	if ( !held ) {
+		if ( aimingBlink ) {
+			if ( blinkTargetValid ) {
+				gameLocal.Printf( "blink: would teleport to (%s)%s%s\n", blinkTargetOrigin.ToString( 1 ),
+					blinkCanVaultLedge ? " on top of a ledge" : "", blinkTargetCrouched ? " crouched" : "" );
+			} else {
+				gameLocal.Printf( "blink: no valid target, cancelled\n" );
+			}
+		}
+		aimingBlink = false;
+		blinkCancelled = false;
+		return;
+	}
+
+	if ( blinkCancelled ) {
+		return;
+	}
+	if ( !CanBlink() ) {
+		// the press doesn't count until it is released, whether it was already aiming or not
+		aimingBlink = false;
+		blinkCancelled = true;
+		return;
+	}
+
+	aimingBlink = true;
+	UpdateBlinkTarget();
+}
+
+/*
+==============
+idPlayer::UpdateBlinkTarget
+
+Traces BLINK_MAX_DISTANCE along the camera. A hit on a wall checks for a ledge on top of it that the
+player box fits on (the same idea as the vault probes). Otherwise the box is placed against whatever
+was hit and dropped to the floor below (FindBlinkSpot).
+  yellow: ledge, red: valid spot on a floor / wall / in the air, grey: no valid spot (the box doesn't fit)
+The player box is drawn where it would end up. The line starts a bit to the right of and below the
+camera, a line straight out of the eye would only be a dot on screen.
+==============
+*/
+void idPlayer::UpdateBlinkTarget( void ) {
+	trace_t		hit;
+	idVec3		spot;
+	bool		crouched;
+
+	const idVec3 up = -physicsObj.GetGravityNormal();
+	const idVec3 &eye = firstPersonViewOrigin;
+	const idVec3 &forward = firstPersonViewAxis[0];
+
+	gameLocal.clip.TracePoint( hit, eye, eye + forward * BLINK_MAX_DISTANCE, MASK_SOLID, this );
+
+	blinkCanVaultLedge = false;
+	blinkTargetValid = false;
+	blinkTargetCrouched = false;
+	if ( hit.fraction < 1.0f && idMath::Fabs( hit.c.normal * up ) < BLINK_WALL_MAX_SLOPE && FindBlinkLedge( hit, spot, crouched ) ) {
+		blinkCanVaultLedge = true;
+		blinkTargetValid = true;
+	} else if ( FindBlinkSpot( hit, forward, spot, crouched ) ) {
+		blinkTargetValid = true;
+	}
+	if ( blinkTargetValid ) {
+		blinkTargetOrigin = spot;
+		blinkTargetCrouched = crouched;
+	}
+
+	const idVec4 &color = blinkCanVaultLedge ? colorYellow : ( blinkTargetValid ? colorRed : colorMdGrey );
+	const idVec3 hand = eye + forward * 8.0f - firstPersonViewAxis[1] * 6.0f - firstPersonViewAxis[2] * 5.0f;
+	const idVec3 boxSize( BLINK_DEBUG_BOX_SIZE, BLINK_DEBUG_BOX_SIZE, BLINK_DEBUG_BOX_SIZE );
+
+	gameRenderWorld->DebugLine( color, hand, hit.endpos );
+	gameRenderWorld->DebugBox( color, idBox( hit.endpos, boxSize, mat3_identity ) );
+	if ( blinkTargetValid ) {
+		// the player box where it would end up
+		idBounds bounds = physicsObj.GetBounds();
+		bounds[1][2] = blinkTargetCrouched ? pm_crouchheight.GetFloat() : pm_normalheight.GetFloat();
+		gameRenderWorld->DebugBounds( color, bounds, blinkTargetOrigin );
+	}
+}
+
+/*
+==============
+idPlayer::FindBlinkSpot
+
+Destination when there is no ledge. The crouched box is put just off the surface that was hit
+(touching it from the outside: on a floor, against a wall, under a ceiling; at the end of the ray if
+nothing was hit) and must fit there cleanly, also when moved back along the ray by BLINK_RETRY_STEP
+once or twice, otherwise there is no valid spot (a crack, a corner too tight for the box). From
+there it is swept down to the nearest floor; with no floor within
+BLINK_DROP_DISTANCE the spot stays in the air and the player would fall. outCrouched is set when
+only the crouched box fits at the end.
+==============
+*/
+bool idPlayer::FindBlinkSpot( const trace_t &hit, const idVec3 &forward, idVec3 &outSpot, bool &outCrouched ) const {
+	trace_t		tr;
+	idVec3		center, spot;
+	idBounds	bounds;
+	float		support;
+
+	const idVec3 up = -physicsObj.GetGravityNormal();
+	const int mask = MASK_PLAYERSOLID & ~CONTENTS_BODY;
+
+	bounds = physicsObj.GetBounds();
+	bounds[1][2] = pm_crouchheight.GetFloat();
+	const idVec3 halfSize = ( bounds[1] - bounds[0] ) * 0.5f;
+	const float halfHeight = halfSize[2];
+
+	if ( hit.fraction < 1.0f ) {
+		// distance from the box center to its face along the normal, the box is axis aligned
+		const idVec3 &n = hit.c.normal;
+		support = halfSize[0] * idMath::Fabs( n[0] ) + halfSize[1] * idMath::Fabs( n[1] ) + halfSize[2] * idMath::Fabs( n[2] );
+		center = hit.endpos + n * ( support + BLINK_SURFACE_GAP );
+	} else {
+		center = hit.endpos;
+	}
+	spot = center - up * halfHeight;
+
+	// a spot that doesn't fit (another wall next to the one that was hit, a corner) is retried a bit
+	// back along the ray, towards the player, before giving up
+	int i;
+	for ( i = 0; i < 3; i++ ) {
+		if ( BlinkBoxFits( spot - forward * ( BLINK_RETRY_STEP * i ), bounds, mask, this ) ) {
+			break;
+		}
+	}
+	if ( i == 3 ) {
+		return false;
+	}
+	spot -= forward * ( BLINK_RETRY_STEP * i );
+
+	// down to the nearest floor
+	const idTraceModel trm( bounds );
+	idClipModel box( trm );
+	gameLocal.clip.Translation( tr, spot, spot - up * BLINK_DROP_DISTANCE, &box, mat3_identity, mask, this );
+	outSpot = tr.endpos;
+
+	// stand there if the standing box fits too
+	bounds[1][2] = pm_normalheight.GetFloat();
+	outCrouched = !BlinkBoxFits( outSpot, bounds, mask, this );
+	return true;
+}
+
+/*
+==============
+idPlayer::FindBlinkLedge
+
+hit is on a wall. Climbs the face in steps of BLINK_LEDGE_STEP, up to BLINK_LEDGE_REACH or a ceiling
+in front of it, probing into the face at each height. Where a probe goes through, the face has ended:
+the top of a block, or the mouth of a duct with more wall above it. From there it goes down onto the
+surface behind the edge, which must be above the hit and walkable, and FitBlinkLedgeSpot finds a
+spot on it the box fits in (see there). Openings are tried lowest first; outSpot is where the player
+would stand (feet) on top of that surface, inside the opening and never against the face or frame.
+==============
+*/
+bool idPlayer::FindBlinkLedge( const trace_t &hit, idVec3 &outSpot, bool &outCrouched ) const {
+	trace_t	tr;
+	idVec3	normal, base, probe, over;
+	float	reach, h;
+	bool	inOpening;
+
+	const idVec3 up = -physicsObj.GetGravityNormal();
+	const float halfWidth = physicsObj.GetBounds()[1][0];
+
+	normal = hit.c.normal - ( hit.c.normal * up ) * up;
+	if ( normal.Normalize() < 0.001f ) {
+		return false;
+	}
+
+	// 1. how far up along the face there is room, just in front of it
+	base = hit.endpos + normal * BLINK_SURFACE_GAP;
+	gameLocal.clip.TracePoint( tr, base, base + up * BLINK_LEDGE_REACH, MASK_SOLID, this );
+	reach = tr.fraction * BLINK_LEDGE_REACH;
+
+	// 2. step up the face looking for where it ends
+	inOpening = false;
+	for ( h = BLINK_LEDGE_STEP; h <= reach; h += BLINK_LEDGE_STEP ) {
+		probe = base + up * h;
+		over = probe - normal * ( BLINK_SURFACE_GAP + halfWidth + BLINK_LEDGE_INSET );
+		gameLocal.clip.TracePoint( tr, probe, over, MASK_SOLID, this );
+		if ( tr.fraction < 1.0f ) {
+			// still the face
+			inOpening = false;
+			continue;
+		}
+		if ( inOpening ) {
+			// same opening as the probe below, its floor was already tried
+			continue;
+		}
+		inOpening = true;
+
+		// 3. down onto the surface behind the edge
+		gameLocal.clip.TracePoint( tr, over, over - up * h, MASK_SOLID, this );
+		if ( tr.fraction <= 0.0f || tr.fraction >= 1.0f || ( tr.c.normal * up ) < BLINK_LEDGE_MIN_NORMAL ) {
+			continue;
+		}
+
+		// 4. a spot on it the box really fits in
+		if ( FitBlinkLedgeSpot( tr.endpos + up * BLINK_LEDGE_CLEARANCE, normal, base, outSpot, outCrouched ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+==============
+idPlayer::FitBlinkLedgeSpot
+
+spot is on the surface behind a ledge or inside the mouth of a duct, BLINK_LEDGE_INSET in past the
+lip; normal points back out of the face and facePoint is just in front of it. The spot is accepted if:
+  - pushed off any side wall that is too close (aiming near the side of a duct), the box fits there
+    with BLINK_FIT_MARGIN on the sides and above: standing, or only crouched in a low duct
+  - the crouched box can slide in from in front of the face to there (a real sweep, so a frame or
+    lintel the box would catch on rejects it; a sweep can't see an overlap at a single spot, that is
+    what the fit test is for)
+Otherwise the same is tried BLINK_RETRY_STEP further in. outSpot is the box origin (feet).
+==============
+*/
+bool idPlayer::FitBlinkLedgeSpot( const idVec3 &spot, const idVec3 &normal, const idVec3 &facePoint, idVec3 &outSpot, bool &outCrouched ) const {
+	trace_t		tr;
+	idVec3		side, candidate, front;
+	idBounds	standing, crouched;
+
+	const idVec3 up = -physicsObj.GetGravityNormal();
+	const float halfWidth = physicsObj.GetBounds()[1][0];
+	const int mask = MASK_PLAYERSOLID & ~CONTENTS_BODY;
+
+	crouched = physicsObj.GetBounds();
+	crouched[1][2] = pm_crouchheight.GetFloat();
+	standing = physicsObj.GetBounds();
+	standing[1][2] = pm_normalheight.GetFloat();
+
+	side = normal.Cross( up );
+	side.Normalize();
+
+	const idTraceModel trm( crouched );
+	idClipModel box( trm );
+
+	for ( int i = 0; i < 2; i++ ) {
+		candidate = PushBlinkSpotOffWalls( spot - normal * ( BLINK_RETRY_STEP * i ), side, crouched[1][2] );
+		if ( !BlinkBoxFits( candidate, BlinkBoundsWithMargin( crouched ), mask, this ) ) {
+			continue;
+		}
+
+		// in front of the face at the same height, the box just touching facePoint's plane
+		front = candidate + normal * ( ( facePoint - candidate ) * normal + halfWidth );
+		if ( !BlinkBoxFits( front, crouched, mask, this ) ) {
+			continue;
+		}
+		gameLocal.clip.Translation( tr, front, candidate, &box, mat3_identity, mask, this );
+		if ( tr.fraction < 1.0f ) {
+			continue;
+		}
+
+		outSpot = candidate;
+		outCrouched = !BlinkBoxFits( candidate, BlinkBoundsWithMargin( standing ), mask, this );
+		return true;
+	}
+	return false;
+}
+
+/*
+==============
+idPlayer::PushBlinkSpotOffWalls
+
+Looks for walls on both sides of the spot (along side, at half the height of the box) and moves the
+spot away from any that is closer than the box needs, so the box ends up clear of the sides of a
+duct instead of half inside one. With walls too close on both sides it is left where it is, the fit
+test then rejects it.
+==============
+*/
+idVec3 idPlayer::PushBlinkSpotOffWalls( const idVec3 &spot, const idVec3 &side, float height ) const {
+	trace_t	left, right;
+
+	const idVec3 up = -physicsObj.GetGravityNormal();
+	const float need = physicsObj.GetBounds()[1][0] + BLINK_FIT_MARGIN + 0.5f;
+	const int mask = MASK_PLAYERSOLID & ~CONTENTS_BODY;
+	const idVec3 mid = spot + up * ( height * 0.5f );
+
+	gameLocal.clip.TracePoint( left, mid, mid - side * BLINK_SIDE_PROBE, mask, this );
+	gameLocal.clip.TracePoint( right, mid, mid + side * BLINK_SIDE_PROBE, mask, this );
+	const float distLeft = left.fraction * BLINK_SIDE_PROBE;
+	const float distRight = right.fraction * BLINK_SIDE_PROBE;
+
+	if ( distLeft < need && distRight >= need + ( need - distLeft ) ) {
+		return spot + side * ( need - distLeft );
+	}
+	if ( distRight < need && distLeft >= need + ( need - distRight ) ) {
+		return spot - side * ( need - distRight );
+	}
+	return spot;
+}
+
+/*
+==============
+idPlayer::UpdateCrouchInput
+
+Rewrites usercmd.upmove before anything reads it:
+
+pm_toggleCrouch 1: a fresh press of the crouch key latches the crouch on or off. Jump still comes
+through (upmove > 0), so it can start a vault or a crouch jump straight from the crouch. Standing
+back up needs room, otherwise the press is ignored and the player stays crouched. Anything else that
+stands the player up (a ladder, the physics) releases the latch too.
+
+Sprint to stand (both modes): asking to sprint (run + forward, freshly) while crouched stands up
+when there is room. Without room the sprint is ignored and the player stays crouched, the request
+is kept while run + forward stay held, so it stands as soon as it gets out from under the ceiling.
+In hold mode the crouch key that is still held is ignored until it is released, so a new press
+(a slide) still works.
+==============
+*/
+void idPlayer::UpdateCrouchInput( void ) {
+	static bool warnedEngineToggle = false;
+	const bool keyDown = ( usercmd.upmove < 0 );
+	const bool pressed = keyDown && !crouchKeyDown;
+	const bool sprintRequest = ( usercmd.buttons & BUTTON_RUN ) && usercmd.forwardmove > 0;
+	const bool sprintPressed = sprintRequest && !sprintRequestDown;
+	bool toggleMode;
+
+	crouchKeyDown = keyDown;
+	sprintRequestDown = sprintRequest;
+
+	if ( health <= 0 || spectating || noclip ) {
+		crouchToggled = false;
+		crouchSuppressed = false;
+		sprintStandPending = false;
+		return;
+	}
+
+	toggleMode = pm_toggleCrouch.GetBool();
+	if ( toggleMode && cvarSystem->GetCVarBool( "in_toggleCrouch" ) ) {
+		// the engine already latches the key: toggling it a second time here would get stuck
+		if ( !warnedEngineToggle ) {
+			warnedEngineToggle = true;
+			gameLocal.Warning( "pm_toggleCrouch is ignored while in_toggleCrouch is 1, set in_toggleCrouch 0" );
+		}
+		toggleMode = false;
+	}
+
+	// the physics stood up on its own (ladder, no longer latched): follow it
+	if ( !toggleMode || ( crouchToggled && !physicsObj.IsCrouching() && !physicsObj.IsVaulting() ) ) {
+		crouchToggled = false;
+	}
+
+	if ( toggleMode && pressed ) {
+		if ( !crouchToggled ) {
+			crouchToggled = true;
+		} else if ( physicsObj.CanUncrouch() ) {
+			crouchToggled = false;
+		}
+		// else: no room above the head, the press is ignored and we stay crouched
+	}
+
+	// sprint to stand
+	if ( !keyDown ) {
+		crouchSuppressed = false;
+	}
+	if ( !sprintRequest || !physicsObj.IsCrouching() ) {
+		sprintStandPending = false;
+	}
+	if ( sprintPressed && physicsObj.IsCrouching() ) {
+		sprintStandPending = true;
+	}
+	if ( sprintStandPending && !physicsObj.IsSliding() && !physicsObj.IsVaulting() && physicsObj.CanUncrouch() ) {
+		sprintStandPending = false;
+		crouchToggled = false;
+		crouchSuppressed = keyDown;
+	}
+
+	if ( crouchSuppressed && usercmd.upmove < 0 ) {
+		usercmd.upmove = 0;
+	}
+	// toggle mode: the key itself no longer holds the crouch, only the latch does. Jump goes through
+	if ( toggleMode && usercmd.upmove <= 0 ) {
+		usercmd.upmove = crouchToggled ? -127 : 0;
+	}
 }
 
 /*
@@ -6018,6 +6520,9 @@ void idPlayer::UpdateVaultView( int msec ) {
 	const vaultState_t state = physicsObj.GetVaultState();
 	const float u = physicsObj.GetVaultProgress();
 	const float dt = MS2SEC( msec );
+	const int vaultDuration = physicsObj.GetVaultDurationMsec();
+	const int vaultViewBaseDurationMsec = 405;
+	const float durationScale = vaultDuration > 0 ? vaultDuration / (float)vaultViewBaseDurationMsec : 1.0f;
 
 	// camera height: during a vault and right after it the camera follows the body through an
 	// exponential ease, so the kinematic move starts and ends softly instead of snapping
@@ -6027,7 +6532,8 @@ void idPlayer::UpdateVaultView( int msec ) {
 		vaultSmoothedEyeZ = vaultLastEyeZ;		// start from where the camera was before this frame's move
 	}
 	if ( vaultSmoothing ) {
-		vaultSmoothedEyeZ += ( eyeZ - vaultSmoothedEyeZ ) * ( 1.0f - idMath::Exp( -VAULT_VIEW_ORIGIN_RATE * dt ) );
+		const float originRate = VAULT_VIEW_ORIGIN_RATE / durationScale;
+		vaultSmoothedEyeZ += ( eyeZ - vaultSmoothedEyeZ ) * ( 1.0f - idMath::Exp( -originRate * dt ) );
 		vaultViewZOffset = vaultSmoothedEyeZ - eyeZ;
 		if ( idMath::Fabs( vaultViewZOffset ) > 96.0f || ( state == VAULT_NONE && idMath::Fabs( vaultViewZOffset ) < 0.05f ) ) {
 			// settled, or teleported
@@ -6036,21 +6542,15 @@ void idPlayer::UpdateVaultView( int msec ) {
 		}
 	}
 
-	// while vaulting (or easing after), the eye can be above the top of a crouch sized box: never
-	// let the camera go into a low ceiling, keep it under whatever is above the box
+	// rigid camera: during and right after a vault the eased camera height never leaves the body's own
+	// box, with CAMERA_CLAMP_SIZE to spare for the near plane. The easing only shapes the motion inside
+	// the box: whatever the box fits under, the camera does too
 	if ( state != VAULT_NONE || vaultSmoothing ) {
-		const idVec3 up = -physicsObj.GetGravityNormal();
-		const idVec3 eye = GetEyePosition();
-		const idVec3 boxTop = physicsObj.GetOrigin() + up * ( physicsObj.GetBounds()[1][2] - 2.0f );
-		const idVec3 camera = eye + up * vaultViewZOffset;
-		if ( ( camera - boxTop ) * up > 0.0f ) {
-			trace_t tr;
-			const idBounds cameraBounds( idVec3( -4.0f, -4.0f, -4.0f ), idVec3( 4.0f, 4.0f, 4.0f ) );
-			gameLocal.clip.TraceBounds( tr, boxTop, camera, cameraBounds, MASK_SOLID, this );
-			if ( tr.fraction < 1.0f ) {
-				vaultViewZOffset = ( tr.endpos - eye ) * up;
-			}
-		}
+		const idBounds &box = physicsObj.GetBounds();
+		const float eyeHeight = EyeHeight();
+		const float low = box[0][2] + Min( CAMERA_CLAMP_SIZE, ( box[1][2] - box[0][2] ) * 0.5f );
+		const float high = Max( box[1][2] - CAMERA_CLAMP_SIZE, low );
+		vaultViewZOffset = idMath::ClampFloat( low, high, eyeHeight + vaultViewZOffset ) - eyeHeight;
 	}
 	vaultLastEyeZ = eyeZ;
 
@@ -6059,15 +6559,17 @@ void idPlayer::UpdateVaultView( int msec ) {
 		vaultLandTime = gameLocal.time;
 	}
 	vaultWasActive = ( state != VAULT_NONE );
-	if ( vaultLandTime && gameLocal.time - vaultLandTime < VAULT_VIEW_LAND_MSEC ) {
-		vaultLandPitch = VAULT_VIEW_LAND_PITCH * idMath::Sin( idMath::PI * ( gameLocal.time - vaultLandTime ) / (float)VAULT_VIEW_LAND_MSEC );
+	const int landMsec = Max( 1, idMath::Ftoi( VAULT_VIEW_LAND_MSEC * durationScale ) );
+	if ( vaultLandTime && gameLocal.time - vaultLandTime < landMsec ) {
+		vaultLandPitch = VAULT_VIEW_LAND_PITCH * idMath::Sin( idMath::PI * ( gameLocal.time - vaultLandTime ) / (float)landMsec );
 	} else {
 		vaultLandPitch = 0.0f;
 	}
 
 	if ( state == VAULT_NONE ) {
 		// settle back to neutral, only noticeable when a vault was cut short
-		const float frac = 1.0f - idMath::Exp( -VAULT_VIEW_BLEND_RATE * dt );
+		const float blendRate = VAULT_VIEW_BLEND_RATE / durationScale;
+		const float frac = 1.0f - idMath::Exp( -blendRate * dt );
 		vaultViewPitch -= vaultViewPitch * frac;
 		vaultViewRoll -= vaultViewRoll * frac;
 		if ( idMath::Fabs( vaultViewPitch ) < 0.001f ) {
@@ -6117,6 +6619,12 @@ void idPlayer::UpdateVaultView( int msec ) {
 			break;
 		default:
 			break;
+	}
+
+	// crouched vaults (or a low ceiling on top) happen in tight spaces: keep the horizon level so
+	// the rolled camera can't swing into a nearby wall or ceiling
+	if ( physicsObj.IsVaultCrouched() ) {
+		vaultViewRoll = 0.0f;
 	}
 
 	// ledge grab: turn the view a few degrees to face the wall during phase 1. This changes the real
@@ -6370,10 +6878,19 @@ void idPlayer::Move( void ) {
 	physicsObj.SetDebugLevel( g_debugMove.GetBool() );
 	physicsObj.SetPlayerInput( usercmd, viewAngles );
 	physicsObj.SetSprinting( IsSprinting() );
+	physicsObj.SetCrouchLatched( crouchToggled );
 
 	// FIXME: physics gets disabled somehow
 	BecomeActive( TH_PHYSICS );
 	RunPhysics();
+
+	// crouching / standing up in the air moved the body under the head (legs tucked or put down):
+	// move the eye the other way so the camera stays put, and keep that shift out of the landing math
+	const float duckShift = physicsObj.ConsumeDuckOriginShift();
+	if ( duckShift != 0.0f ) {
+		currentViewHeight -= duckShift;
+		oldOrigin -= physicsObj.GetGravityNormal() * duckShift;
+	}
 
 	// update our last valid AAS location for the AI
 	SetAASLocation();
@@ -6654,6 +7171,9 @@ void idPlayer::Think( void ) {
 		weapon.GetEntity()->SetPushVelocity( physicsObj.GetPushedLinearVelocity() );
 	}
 
+	// hold / toggle crouch and sprint to stand, rewrites usercmd.upmove before anything reads it
+	UpdateCrouchInput();
+
 	EvaluateControls();
 
 	if ( !af.IsActive() ) {
@@ -6710,6 +7230,9 @@ void idPlayer::Think( void ) {
 	// calculate the exact bobbed view position, which is used to
 	// position the view weapon, among other things
 	CalculateFirstPersonView();
+
+	// blink aiming traces from the final camera of this frame
+	UpdateBlink();
 
 	// this may use firstPersonView, or a thirdPeroson / camera view
 	CalculateRenderView();
@@ -7652,6 +8175,10 @@ void idPlayer::GetViewPos( idVec3 &origin, idMat3 &axis ) const {
 		origin += physicsObj.GetGravityNormal() * g_viewNodalZ.GetFloat();
 		origin += axis[0] * g_viewNodalX.GetFloat() + axis[2] * g_viewNodalZ.GetFloat();
 	}
+
+	// bob, lean, vault easing and the nodal offset all move the camera away from the eye: keep the
+	// final position inside the playable space so the outside of the map can never be seen
+	playerView.ClampCameraToWorld( origin );
 }
 
 /*
