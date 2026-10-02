@@ -2864,6 +2864,7 @@ void idWeapon::Event_LaunchProjectiles( int num_projectiles, float spread, float
 	if ( !silent_fire ) {
 		// wake up nearby monsters
 		gameLocal.AlertAI( owner );
+		gameLocal.EmitSoundEvent( owner->GetEyePosition(), SOUNDPROP_VOLUME_WEAPON_FIRE, SND_TYPE_COMBAT, owner );
 	}
 
 	// set the shader parm to the time of last projectile firing,
@@ -3080,6 +3081,10 @@ void idWeapon::Event_Melee( void ) {
 							gameLocal.ProjectDecal( tr.c.point, -tr.c.normal, 8.0f, true, 6.0, decal );
 						}
 						nextStrikeFx = gameLocal.time + 200;
+
+						// striking the world is loud, off the surface so the occlusion trace doesn't start in it
+						gameLocal.EmitSoundEvent( tr.c.point + tr.c.normal * 4.0f, SOUNDPROP_VOLUME_MELEE_WORLD + SoundProp_SurfaceModifier( type ),
+							SND_TYPE_IMPACT, owner );
 					} else {
 						hitSound = "";
 					}

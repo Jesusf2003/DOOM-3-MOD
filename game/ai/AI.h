@@ -33,6 +33,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Entity.h"
 #include "Actor.h"
 #include "Projectile.h"
+#include "SoundProp.h"
 
 /*
 ===============================================================================
@@ -49,6 +50,14 @@ const float	AI_SEEK_PREDICTION			= 0.3f;
 const float	AI_FLY_DAMPENING			= 0.15f;
 const float	AI_HEARING_RANGE			= 2048.0f;
 const int	DEFAULT_FLY_OFFSET			= 68;
+
+// awareness / incapacitation states (queried by the player's takedowns)
+const int	AI_COMBAT_MEMORY_MSEC		= 3000;		// still in combat this long after last seeing, attacking or being hurt by the enemy
+const int	AI_SUSPICION_MSEC			= 6000;		// stays suspicious this long after losing the enemy or being hurt blind
+// savegames from before this internal savegame version (idGameLocal::INTERNAL_SAVEGAME_VERSION) start unaware
+const int	AI_SAVEGAME_AWARENESS		= 4;
+// last heard stealth sound (lastHeardSound*), older savegames start without one
+const int	AI_SAVEGAME_HEARING			= 5;
 
 #define ATTACK_IGNORE			0
 #define ATTACK_ON_DAMAGE		1
@@ -247,6 +256,18 @@ class idAI : public idActor {
 public:
 	CLASS_PROTOTYPE( idAI );
 
+	enum aiAwarenessState_t {
+		AI_AWARENESS_UNAWARE,		// fully off guard (patrolling or idle)
+		AI_AWARENESS_SUSPICIOUS,	// lost the enemy or got hurt without seeing by whom, searching
+		AI_AWARENESS_COMBAT			// sees or is fighting its enemy
+	};
+
+	enum aiPhysState_t {
+		AI_PHYS_NORMAL,
+		AI_PHYS_STAGGERED,			// off balance for a while (front takedown window)
+		AI_PHYS_UNCONSCIOUS			// knocked out (non lethal)
+	};
+
 							idAI();
 							~idAI();
 
@@ -262,6 +283,22 @@ public:
 	bool					GetAimDir( const idVec3 &firePos, idEntity *aimAtEnt, const idEntity *ignore, idVec3 &aimDir ) const;
 
 	void					TouchedByFlashlight( idActor *flashlight_owner );
+
+	// awareness / incapacitation, updated in Think
+	aiAwarenessState_t		GetAwarenessState( void ) const { return awarenessState; }
+	bool					IsUnaware( void ) const { return awarenessState == AI_AWARENESS_UNAWARE; }
+	bool					IsSuspicious( void ) const { return awarenessState == AI_AWARENESS_SUSPICIOUS; }
+	bool					IsInCombat( void ) const { return awarenessState == AI_AWARENESS_COMBAT; }
+	bool					IsStaggered( void ) const;
+	bool					IsUnconscious( void ) const { return physState == AI_PHYS_UNCONSCIOUS; }
+	void					SetStagger( int durationMs );
+
+	// stealth hearing, fed by idGameLocal::EmitSoundEvent
+	bool					CanHearSounds( void ) const;
+	void					OnHeardSound( const idVec3 &origin, float volume, soundType_t type );
+	float					GetHearingThreshold( void ) const { return hearingThreshold; }
+	const idVec3 &			GetLastHeardSoundOrigin( void ) const { return lastHeardSoundOrigin; }
+	int						GetLastHeardSoundTime( void ) const { return lastHeardSoundTime; }
 
 							// Outputs a list of all monsters to the console.
 	static void				List_f( const idCmdArgs &args );
@@ -398,6 +435,21 @@ protected:
 	idVec3					lastVisibleReachableEnemyPos;
 	idVec3					lastReachableEnemyPos;
 	bool					wakeOnFlashlight;
+
+	// awareness / incapacitation
+	aiAwarenessState_t		awarenessState;
+	aiPhysState_t			physState;
+	int						staggerEndTime;		// staggered until this time
+	int						suspicionTime;		// last time something made it suspicious (enemy out of sight, hurt blind)
+
+	void					UpdateAwarenessState( void );
+
+	// stealth hearing
+	float					hearingThreshold;		// quietest received dB it reacts to ("hearing_threshold", from spawnArgs, not saved)
+	idVec3					lastHeardSoundOrigin;
+	float					lastHeardSoundVolume;	// received dB
+	int						lastHeardSoundTime;		// 0: never heard anything
+	soundType_t				lastHeardSoundType;
 
 	// script variables
 	idScriptBool			AI_TALK;

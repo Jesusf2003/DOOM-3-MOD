@@ -44,6 +44,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "anim/Anim.h"
 #include "Pvs.h"
 #include "MultiplayerGame.h"
+#include "SoundProp.h"
 
 #ifdef ID_DEBUG_UNINITIALIZED_MEMORY
 // This is real evil but allows the code to inspect arbitrary class variables.
@@ -392,6 +393,11 @@ public:
 	void					AlertAI( idEntity *ent );
 	idActor *				GetAlertEntity( void );
 
+							// stealth sound propagation (SoundProp.cpp)
+	void					EmitSoundEvent( const soundEvent_t &event );
+	void					EmitSoundEvent( const idVec3 &origin, float volume, soundType_t type, idEntity *maker );
+	float					GetSoundObstacleLoss( const idVec3 &from, const idVec3 &to, const idEntity *maker, soundObstacle_t &obstacle ) const;
+
 	bool					InPlayerPVS( idEntity *ent ) const;
 	bool					InPlayerConnectedArea( idEntity *ent ) const;
 
@@ -458,7 +464,7 @@ public:
 
 private:
 	const static int		INITIAL_SPAWN_COUNT = 1;
-	const static int		INTERNAL_SAVEGAME_VERSION = 2; // DG: added this for >= 1305 savegames. 2: idPlayer::hasBlinkSkill (PLAYER_SAVEGAME_SKILLS)
+	const static int		INTERNAL_SAVEGAME_VERSION = 5; // DG: added this for >= 1305 savegames. 2: idPlayer::hasBlinkSkill (PLAYER_SAVEGAME_SKILLS) 3: idPlayer off-hand viewmodel (PLAYER_SAVEGAME_OFFHAND) 4: idAI awareness / incapacitation states (AI_SAVEGAME_AWARENESS) 5: idAI last heard stealth sound (AI_SAVEGAME_HEARING)
 
 	idStr					mapFileName;			// name of the map, empty string if no map loaded
 	idMapFile *				mapFile;				// will be NULL during the game unless in-game editing is used

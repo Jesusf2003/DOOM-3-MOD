@@ -280,6 +280,11 @@ bool idMoveable::Collide( const trace_t &collision, const idVec3 &velocity ) {
 			SetSoundVolume( f );
 		}
 		nextSoundTime = gameLocal.time + 500;
+
+		// thrown or knocked over: a distraction the AI can hear
+		const float volume = SOUNDPROP_VOLUME_IMPACT_MIN + f * ( SOUNDPROP_VOLUME_IMPACT_MAX - SOUNDPROP_VOLUME_IMPACT_MIN );
+		const float surface = collision.c.material ? SoundProp_SurfaceModifier( collision.c.material->GetSurfaceType() ) : 0.0f;
+		gameLocal.EmitSoundEvent( collision.c.point + collision.c.normal * 4.0f, volume + surface, SND_TYPE_DISTRACTION, this );
 	}
 
 	if ( canDamage && damage.Length() && gameLocal.time > nextDamageTime ) {

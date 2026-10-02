@@ -509,6 +509,47 @@ void Cmd_Noclip_f( const idCmdArgs &args ) {
 
 /*
 =================
+Cmd_TestSoundEvent_f
+
+testSoundEvent [dB] [footstep|impact|combat|distraction]: a stealth noise where the player looks
+=================
+*/
+void Cmd_TestSoundEvent_f( const idCmdArgs &args ) {
+	idPlayer *player = gameLocal.GetLocalPlayer();
+	if ( !player || !gameLocal.CheatsOk() ) {
+		return;
+	}
+
+	const float volume = ( args.Argc() > 1 ) ? atof( args.Argv( 1 ) ) : SOUNDPROP_VOLUME_RUN;
+	soundType_t type = SND_TYPE_DISTRACTION;
+	if ( args.Argc() > 2 ) {
+		int i;
+		for ( i = 0; i < SND_TYPE_COUNT; i++ ) {
+			if ( !idStr::Icmp( args.Argv( 2 ), SoundProp_TypeName( static_cast<soundType_t>( i ) ) ) ) {
+				break;
+			}
+		}
+		if ( i == SND_TYPE_COUNT ) {
+			gameLocal.Printf( "usage: testSoundEvent [dB] [footstep|impact|combat|distraction]\n" );
+			return;
+		}
+		type = static_cast<soundType_t>( i );
+	}
+
+	idVec3 origin;
+	idMat3 axis;
+	trace_t tr;
+	player->GetViewPos( origin, axis );
+	gameLocal.clip.TracePoint( tr, origin, origin + axis[0] * 4096.0f, MASK_SHOT_RENDERMODEL, player );
+	const idVec3 spot = tr.endpos + tr.c.normal * ( ( tr.fraction < 1.0f ) ? 4.0f : 0.0f );
+
+	gameLocal.Printf( "%s %.1f dB at %.0f, %.0f, %.0f\n", SoundProp_TypeName( type ), volume, spot.x, spot.y, spot.z );
+	// no maker: the player's team mates would ignore it
+	gameLocal.EmitSoundEvent( spot, volume, type, NULL );
+}
+
+/*
+=================
 Cmd_Kill_f
 =================
 */
@@ -2352,6 +2393,7 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "notarget",				Cmd_Notarget_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"disables the player as a target" );
 	cmdSystem->AddCommand( "noclip",				Cmd_Noclip_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"disables collision detection for the player" );
 	cmdSystem->AddCommand( "kill",					Cmd_Kill_f,					CMD_FL_GAME,				"kills the player" );
+	cmdSystem->AddCommand( "testSoundEvent",		Cmd_TestSoundEvent_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"emits a stealth sound event where the player looks: testSoundEvent [dB] [type]" );
 	cmdSystem->AddCommand( "where",					Cmd_GetViewpos_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"prints the current view position" );
 	cmdSystem->AddCommand( "getviewpos",			Cmd_GetViewpos_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"prints the current view position" );
 	cmdSystem->AddCommand( "setviewpos",			Cmd_SetViewpos_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"sets the current view position" );

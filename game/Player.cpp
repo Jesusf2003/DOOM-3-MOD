@@ -1050,6 +1050,10 @@ idPlayer::idPlayer() {
 	firstPersonViewOrigin	= vec3_zero;
 	firstPersonViewAxis		= mat3_identity;
 
+	offHandWorldModel		= NULL;
+	offHandDefName			= "";
+	offHandActive			= false;
+
 	hipJoint				= INVALID_JOINT;
 	chestJoint				= INVALID_JOINT;
 	headJoint				= INVALID_JOINT;
@@ -1678,6 +1682,8 @@ Release any resources used by the player.
 idPlayer::~idPlayer() {
 	delete weapon.GetEntity();
 	weapon = NULL;
+
+	ClearOffHandViewmodel();
 }
 
 /*
@@ -1887,6 +1893,11 @@ void idPlayer::Save( idSaveGame *savefile ) const {
 
 	// PLAYER_SAVEGAME_SKILLS
 	savefile->WriteBool( hasBlinkSkill );
+
+	// PLAYER_SAVEGAME_OFFHAND (the entity itself is saved with the other entities)
+	offHandWorldModel.Save( savefile );
+	savefile->WriteString( offHandDefName );
+	savefile->WriteBool( offHandActive );
 
 	if ( hud ) {
 		hud->SetStateString( "message", common->GetLanguageDict()->GetString( "#str_02916" ) );
@@ -2145,6 +2156,17 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 		hasBlinkSkill = false;
 	}
 
+	// off-hand viewmodel, savegames from before it existed start without one
+	if ( savefile->GetInternalSavegameVersion() >= PLAYER_SAVEGAME_OFFHAND ) {
+		offHandWorldModel.Restore( savefile );
+		savefile->ReadString( offHandDefName );
+		savefile->ReadBool( offHandActive );
+	} else {
+		offHandWorldModel = NULL;
+		offHandDefName = "";
+		offHandActive = false;
+	}
+
 	// create combat collision hull for exact collision detection
 	SetCombatModel();
 
@@ -2195,6 +2217,7 @@ idPlayer::PrepareForRestart
 */
 void idPlayer::PrepareForRestart( void ) {
 	ClearPowerUps();
+	ClearOffHandViewmodel();
 	Spectate( true );
 	forceRespawn = true;
 
@@ -4700,6 +4723,49 @@ void idPlayer::UpdateFocus( void ) {
 
 /*
 =================
+idPlayer::GetGroundSoundModifier
+
+dB the floor adds to footsteps and landings (metal rings, carpet muffles).
+=================
+*/
+float idPlayer::GetGroundSoundModifier( void ) const {
+	if ( !physicsObj.HasGroundContacts() ) {
+		return 0.0f;
+	}
+	const idMaterial *material = physicsObj.GetContact( 0 ).material;
+	return material ? SoundProp_SurfaceModifier( material->GetSurfaceType() ) : 0.0f;
+}
+
+/*
+=================
+idPlayer::PlayFootStepSound
+
+The audible footstep (leftfoot / rightfoot frame commands of the legs anims), plus its stealth noise.
+=================
+*/
+void idPlayer::PlayFootStepSound( void ) {
+	idActor::PlayFootStepSound();
+
+	if ( noclip || spectating || health <= 0 || !physicsObj.HasGroundContacts() ) {
+		return;
+	}
+
+	float volume;
+	if ( physicsObj.IsCrouching() ) {
+		volume = SOUNDPROP_VOLUME_CROUCH;
+	} else if ( IsSprinting() || xyspeed > pm_walkspeed.GetFloat() * 1.1f ) {
+		volume = SOUNDPROP_VOLUME_RUN;
+	} else {
+		volume = SOUNDPROP_VOLUME_WALK;
+	}
+
+	// a bit above the floor so the occlusion trace doesn't start in it
+	const idVec3 origin = physicsObj.GetOrigin() - physicsObj.GetGravityNormal() * 8.0f;
+	gameLocal.EmitSoundEvent( origin, volume + GetGroundSoundModifier(), SND_TYPE_FOOTSTEP, this );
+}
+
+/*
+=================
 idPlayer::CrashLand
 
 Check for hard landings that generate sound events
@@ -4795,6 +4861,13 @@ void idPlayer::CrashLand( const idVec3 &oldOrigin, const idVec3 &oldVelocity ) {
 	} else {
 		fatalDelta	= 65.0f;
 		hardDelta	= 45.0f;
+	}
+
+	// stealth noise of the landing: from just walking on (delta 3) up to a fall that would hurt
+	if ( delta > 3.0f ) {
+		const float frac = idMath::ClampFloat( 0.0f, 1.0f, ( delta - 3.0f ) / ( hardDelta - 3.0f ) );
+		const float volume = SOUNDPROP_VOLUME_LAND_SOFT + frac * ( SOUNDPROP_VOLUME_LAND_HARD - SOUNDPROP_VOLUME_LAND_SOFT );
+		gameLocal.EmitSoundEvent( origin - gravityNormal * 8.0f, volume + GetGroundSoundModifier(), SND_TYPE_IMPACT, this );
 	}
 
 	if ( delta > fatalDelta ) {
@@ -7245,6 +7318,9 @@ void idPlayer::Think( void ) {
 		UpdateWeapon();
 	}
 
+	// off-hand follows the same final camera as the main weapon
+	UpdateOffHandTransform();
+
 	UpdateAir();
 
 	UpdateHud();
@@ -8182,6 +8258,111 @@ void idPlayer::GetViewPos( idVec3 &origin, idMat3 &axis ) const {
 }
 
 /*
+==================
+idPlayer::SetupOffHandViewmodel
+
+Spawns the left hand viewmodel from an entityDef (spawnclass idAnimatedEntity, with a "model")
+and makes it follow the view, independently of the main weapon. Replaces any previous one.
+==================
+*/
+void idPlayer::SetupOffHandViewmodel( const char *defName ) {
+	ClearOffHandViewmodel();
+
+	// the server owns the entity, clients get it through the snapshot
+	if ( gameLocal.isClient || defName == NULL || defName[0] == '\0' ) {
+		return;
+	}
+
+	if ( gameLocal.FindEntityDefDict( defName, false ) == NULL ) {
+		gameLocal.Warning( "idPlayer::SetupOffHandViewmodel: unknown entityDef '%s'", defName );
+		return;
+	}
+
+	idDict args;
+	args.Set( "classname", defName );
+	args.SetVector( "origin", firstPersonViewOrigin );
+	args.SetMatrix( "rotation", firstPersonViewAxis );
+	args.SetBool( "noclipmodel", true );		// view geometry, never collides
+
+	idEntity *ent = NULL;
+	if ( !gameLocal.SpawnEntityDef( args, &ent ) || ent == NULL ) {
+		gameLocal.Warning( "idPlayer::SetupOffHandViewmodel: couldn't spawn '%s'", defName );
+		return;
+	}
+	if ( !ent->IsType( idAnimatedEntity::Type ) ) {
+		gameLocal.Warning( "idPlayer::SetupOffHandViewmodel: '%s' is not an idAnimatedEntity", defName );
+		delete ent;
+		return;
+	}
+
+	ent->GetPhysics()->SetContents( 0 );
+	ent->GetPhysics()->SetClipMask( 0 );
+	ent->GetRenderEntity()->noShadow = true;
+
+	offHandWorldModel = static_cast<idAnimatedEntity *>( ent );
+	offHandDefName = defName;
+	offHandActive = true;
+
+	UpdateOffHandTransform();
+}
+
+/*
+==================
+idPlayer::UpdateOffHandTransform
+
+Places the off-hand on the final first person camera of this frame, call after CalculateFirstPersonView.
+==================
+*/
+void idPlayer::UpdateOffHandTransform( void ) {
+	idAnimatedEntity *model = offHandWorldModel.GetEntity();
+	if ( !offHandActive || model == NULL ) {
+		return;
+	}
+
+	// hidden whenever there's no first person view to attach to
+	if ( spectating || health <= 0 || gameLocal.inCinematic || pm_thirdPerson.GetBool() ) {
+		if ( !model->IsHidden() ) {
+			model->Hide();
+		}
+		return;
+	}
+
+	const idMat3 &viewAxis = firstPersonViewAxis;
+	const idVec3 origin = firstPersonViewOrigin + viewAxis[1] * OFFHAND_VIEW_OFFSET_LEFT + viewAxis[2] * OFFHAND_VIEW_OFFSET_UP;
+
+	// first person only: drawn in this player's view, with the depth range crunched so it never pokes into walls.
+	// set every frame so it also holds after a savegame or a model change
+	renderEntity_t *renderEnt = model->GetRenderEntity();
+	renderEnt->allowSurfaceInViewID = entityNumber + 1;
+	renderEnt->weaponDepthHack = true;
+
+	model->SetOrigin( origin );
+	model->SetAxis( viewAxis );
+	if ( model->IsHidden() ) {
+		model->Show();
+	}
+
+	// the entity may think before the player: animate and present now so it doesn't lag a frame behind the camera
+	model->UpdateAnimation();
+	model->Present();
+}
+
+/*
+==================
+idPlayer::ClearOffHandViewmodel
+==================
+*/
+void idPlayer::ClearOffHandViewmodel( void ) {
+	// clients don't own the entity, the server removes it
+	if ( !gameLocal.isClient ) {
+		delete offHandWorldModel.GetEntity();
+	}
+	offHandWorldModel = NULL;
+	offHandDefName = "";
+	offHandActive = false;
+}
+
+/*
 ===============
 idPlayer::CalculateFirstPersonView
 ===============
@@ -8803,6 +8984,8 @@ void idPlayer::ClientPredictionThink( void ) {
 	if ( !gameLocal.inCinematic && weapon.GetEntity() && ( health > 0 ) && !( gameLocal.isMultiplayer && spectating ) ) {
 		UpdateWeapon();
 	}
+
+	UpdateOffHandTransform();
 
 	UpdateHud();
 

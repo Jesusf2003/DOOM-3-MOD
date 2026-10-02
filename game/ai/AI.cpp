@@ -34,6 +34,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "SmokeParticles.h"
 
 #include "ai/AI.h"
+#include "Player.h"
 
 static const char *moveCommandString[ NUM_MOVE_COMMANDS ] = {
 	"MOVE_NONE",
@@ -316,6 +317,15 @@ idAI::idAI() {
 	lastHitCheckResult	= false;
 	lastHitCheckTime	= 0;
 	lastAttackTime		= 0;
+	awarenessState		= AI_AWARENESS_UNAWARE;
+	physState			= AI_PHYS_NORMAL;
+	staggerEndTime		= 0;
+	suspicionTime		= 0;
+	hearingThreshold	= SOUNDPROP_DEFAULT_HEARING;
+	lastHeardSoundOrigin.Zero();
+	lastHeardSoundVolume = 0.0f;
+	lastHeardSoundTime	= 0;
+	lastHeardSoundType	= SND_TYPE_FOOTSTEP;
 	melee_range			= 0.0f;
 	projectile_height_to_distance_ratio = 1.0f;
 	projectileDef		= NULL;
@@ -531,6 +541,18 @@ void idAI::Save( idSaveGame *savefile ) const {
 	savefile->WriteJoint( flyTiltJoint );
 
 	savefile->WriteBool( GetPhysics() == static_cast<const idPhysics *>(&physicsObj) );
+
+	// AI_SAVEGAME_AWARENESS
+	savefile->WriteInt( awarenessState );
+	savefile->WriteInt( physState );
+	savefile->WriteInt( staggerEndTime );
+	savefile->WriteInt( suspicionTime );
+
+	// AI_SAVEGAME_HEARING
+	savefile->WriteVec3( lastHeardSoundOrigin );
+	savefile->WriteFloat( lastHeardSoundVolume );
+	savefile->WriteInt( lastHeardSoundTime );
+	savefile->WriteInt( lastHeardSoundType );
 }
 
 /*
@@ -680,6 +702,39 @@ void idAI::Restore( idRestoreGame *savefile ) {
 
 	savefile->ReadBool( restorePhysics );
 
+	// awareness states, savegames from before they existed start unaware and are re-evaluated on the next think
+	if ( savefile->GetInternalSavegameVersion() >= AI_SAVEGAME_AWARENESS ) {
+		int state;
+		savefile->ReadInt( state );
+		awarenessState = static_cast<aiAwarenessState_t>( state );
+		savefile->ReadInt( state );
+		physState = static_cast<aiPhysState_t>( state );
+		savefile->ReadInt( staggerEndTime );
+		savefile->ReadInt( suspicionTime );
+	} else {
+		awarenessState = AI_AWARENESS_UNAWARE;
+		physState = AI_PHYS_NORMAL;
+		staggerEndTime = 0;
+		suspicionTime = 0;
+	}
+
+	// last heard sound, savegames from before it existed haven't heard anything
+	if ( savefile->GetInternalSavegameVersion() >= AI_SAVEGAME_HEARING ) {
+		int type;
+		savefile->ReadVec3( lastHeardSoundOrigin );
+		savefile->ReadFloat( lastHeardSoundVolume );
+		savefile->ReadInt( lastHeardSoundTime );
+		savefile->ReadInt( type );
+		lastHeardSoundType = static_cast<soundType_t>( type );
+	} else {
+		lastHeardSoundOrigin.Zero();
+		lastHeardSoundVolume = 0.0f;
+		lastHeardSoundTime = 0;
+		lastHeardSoundType = SND_TYPE_FOOTSTEP;
+	}
+	// not saved, the def can be tuned between saves
+	hearingThreshold = spawnArgs.GetFloat( "hearing_threshold", va( "%f", SOUNDPROP_DEFAULT_HEARING ) );
+
 	// Set the AAS if the character has the correct gravity vector
 	idVec3 gravity = spawnArgs.GetVector( "gravityDir", "0 0 -1" );
 	gravity *= g_gravity.GetFloat();
@@ -718,6 +773,12 @@ void idAI::Spawn( void ) {
 		PostEventMS( &EV_Remove, 0 );
 		return;
 	}
+
+	awarenessState		= AI_AWARENESS_UNAWARE;
+	physState			= AI_PHYS_NORMAL;
+	staggerEndTime		= 0;
+	suspicionTime		= 0;
+	hearingThreshold	= spawnArgs.GetFloat( "hearing_threshold", va( "%f", SOUNDPROP_DEFAULT_HEARING ) );
 
 	spawnArgs.GetInt(	"team",					"1",		team );
 	spawnArgs.GetInt(	"rank",					"0",		rank );
@@ -1124,6 +1185,9 @@ void idAI::Think( void ) {
 				break;
 			}
 		}
+
+		// after the enemy position and script ran, so the state matches this frame
+		UpdateAwarenessState();
 
 		// clear pain flag so that we recieve any damage between now and the next time we run the script
 		AI_PAIN = false;
@@ -3209,6 +3273,9 @@ bool idAI::Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVe
 	AI_PAIN = idActor::Pain( inflictor, attacker, damage, dir, location );
 	AI_DAMAGE = true;
 
+	// hurt: at least suspicious, even if the attacker isn't (or can't become) its enemy
+	suspicionTime = gameLocal.time;
+
 	// force a blink
 	blink_time = 0;
 
@@ -3599,6 +3666,121 @@ idAI::TouchedByFlashlight
 void idAI::TouchedByFlashlight( idActor *flashlight_owner ) {
 	if ( wakeOnFlashlight ) {
 		Activate( flashlight_owner );
+	}
+}
+
+/*
+=====================
+idAI::IsStaggered
+=====================
+*/
+bool idAI::IsStaggered( void ) const {
+	return ( physState == AI_PHYS_STAGGERED ) && ( gameLocal.time < staggerEndTime );
+}
+
+/*
+=====================
+idAI::SetStagger
+
+Off balance for durationMs, extends a running stagger but never shortens it.
+=====================
+*/
+void idAI::SetStagger( int durationMs ) {
+	if ( AI_DEAD || physState == AI_PHYS_UNCONSCIOUS || durationMs <= 0 ) {
+		return;
+	}
+
+	const int endTime = gameLocal.time + durationMs;
+	if ( !IsStaggered() || endTime > staggerEndTime ) {
+		staggerEndTime = endTime;
+	}
+	physState = AI_PHYS_STAGGERED;
+}
+
+/*
+=====================
+idAI::CanHearSounds
+=====================
+*/
+bool idAI::CanHearSounds( void ) const {
+	return !AI_DEAD && health > 0 && !IsUnconscious() && !IsHidden();
+}
+
+/*
+=====================
+idAI::OnHeardSound
+
+A stealth noise reached it with this many dB (after distance and obstacles). Loud enough: an unaware
+AI becomes suspicious and looks toward it, one that is already hunting or fighting only remembers it.
+=====================
+*/
+void idAI::OnHeardSound( const idVec3 &origin, float volume, soundType_t type ) {
+	if ( !CanHearSounds() || volume < hearingThreshold ) {
+		return;
+	}
+
+	lastHeardSoundOrigin = origin;
+	lastHeardSoundVolume = volume;
+	lastHeardSoundTime = gameLocal.time;
+	lastHeardSoundType = type;
+
+	// keeps it suspicious for AI_SUSPICION_MSEC (UpdateAwarenessState)
+	suspicionTime = gameLocal.time;
+	if ( awarenessState == AI_AWARENESS_UNAWARE ) {
+		awarenessState = AI_AWARENESS_SUSPICIOUS;
+	}
+
+	// investigate: face the noise, unless the script is fighting or walking it somewhere (it owns the facing then)
+	if ( !enemy.GetEntity() && move.moveCommand == MOVE_NONE ) {
+		TurnToward( origin );
+	}
+
+	if ( g_debugSoundProp.GetInteger() ) {
+		const idPlayer *player = gameLocal.GetLocalPlayer();
+		const idMat3 axis = player ? player->viewAngles.ToMat3() : mat3_identity;
+		const idVec3 head = GetEyePosition() + idVec3( 0.0f, 0.0f, 16.0f );
+		gameRenderWorld->DrawText( va( "[AI] Heard Sound at %.0f, %.0f, %.0f!", origin.x, origin.y, origin.z ), head, 0.2f, colorYellow, axis, 1, 2000 );
+		gameRenderWorld->DebugArrow( colorYellow, GetEyePosition(), origin, 4, 2000 );
+		gameLocal.Printf( "[AI] %s heard %s at %.0f, %.0f, %.0f (%.1f dB, threshold %.1f)\n", name.c_str(),
+			SoundProp_TypeName( type ), origin.x, origin.y, origin.z, volume, hearingThreshold );
+	}
+}
+
+/*
+=====================
+idAI::UpdateAwarenessState
+
+Maps the stock AI flags to the awareness states. Doom 3 monsters have no search state of their own:
+they pick an enemy as soon as they notice anything and keep it, so a known enemy out of sight counts
+as suspicious (hunting) and being hurt without an enemy makes it suspicious for a while.
+=====================
+*/
+void idAI::UpdateAwarenessState( void ) {
+	if ( physState == AI_PHYS_STAGGERED && gameLocal.time >= staggerEndTime ) {
+		physState = AI_PHYS_NORMAL;
+	}
+
+	// dead or knocked out: keep the last state, nothing is noticed
+	if ( AI_DEAD || physState == AI_PHYS_UNCONSCIOUS ) {
+		return;
+	}
+
+	if ( enemy.GetEntity() ) {
+		if ( AI_ENEMY_VISIBLE ) {
+			suspicionTime = gameLocal.time;
+		}
+
+		const bool recentContact = ( gameLocal.time - suspicionTime < AI_COMBAT_MEMORY_MSEC );
+		const bool recentAttack = ( lastAttackTime > 0 ) && ( gameLocal.time - lastAttackTime < AI_COMBAT_MEMORY_MSEC );
+		if ( AI_ENEMY_VISIBLE || recentContact || recentAttack ) {
+			awarenessState = AI_AWARENESS_COMBAT;
+		} else {
+			awarenessState = AI_AWARENESS_SUSPICIOUS;
+		}
+	} else if ( suspicionTime > 0 && gameLocal.time - suspicionTime < AI_SUSPICION_MSEC ) {
+		awarenessState = AI_AWARENESS_SUSPICIOUS;
+	} else {
+		awarenessState = AI_AWARENESS_UNAWARE;
 	}
 }
 

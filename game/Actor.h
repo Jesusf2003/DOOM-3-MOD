@@ -272,11 +272,13 @@ protected:
 							// copies animation from body to head joints
 	void					CopyJointsFromBodyToHead( void );
 
+							// footstep frame commands, the player adds its stealth noise
+	virtual void			PlayFootStepSound( void );
+
 private:
 	void					SyncAnimChannels( int channel, int syncToChannel, int blendFrames );
 	void					FinishSetup( void );
 	void					SetupHead( void );
-	void					PlayFootStepSound( void );
 
 	void					Event_EnableEyeFocus( void );
 	void					Event_DisableEyeFocus( void );

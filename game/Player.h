@@ -94,6 +94,12 @@ const float LEAN_SPEED = 5.0f;			// leanAmount change per second (0.2s to fully 
 // skills unlocked with "give_skill <name>", kept across levels and in savegames. Savegames from before
 // this internal savegame version (idGameLocal::INTERNAL_SAVEGAME_VERSION) don't have them and still load
 const int PLAYER_SAVEGAME_SKILLS = 2;
+// off-hand viewmodel state (offHandDefName, offHandActive, offHandWorldModel), older savegames start without it
+const int PLAYER_SAVEGAME_OFFHAND = 3;
+
+// off-hand viewmodel (left hand: magic / flashlight), placed relative to the first person view
+const float OFFHAND_VIEW_OFFSET_LEFT = 8.0f;		// along the view's left axis (axis[1]: x forward, y left, z up)
+const float OFFHAND_VIEW_OFFSET_UP = -6.0f;		// along the view's up axis (axis[2]), negative = down
 
 // blink (prototype: aiming only), bound with "bind MOUSE2 _button7" (BUTTON_7 is the last free usercmd bit)
 const int BUTTON_BLINK = BUTTON_7;
@@ -502,6 +508,15 @@ public:
 	float					GetVaultViewPitch( void ) const { return vaultViewPitch + vaultLandPitch; }
 	float					GetVaultViewZOffset( void ) const { return vaultViewZOffset; }
 	float					GetVaultViewRoll( void ) const { return vaultViewRoll; }
+
+	// off-hand viewmodel, independent of the main weapon (infrastructure only, nothing calls Setup yet)
+	void					SetupOffHandViewmodel( const char *defName );
+	void					UpdateOffHandTransform( void );
+	void					ClearOffHandViewmodel( void );
+	bool					IsOffHandActive( void ) const { return offHandActive; }
+
+	// stealth noises (SoundProp.h)
+	float					GetGroundSoundModifier( void ) const;
 	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 
 	bool					Give( const char *statname, const char *value );
@@ -663,6 +678,10 @@ private:
 	float					vaultLastEyeZ;		// eye height along the up axis last frame
 	float					vaultViewZOffset;	// eased minus real camera height, applied in idPlayerView::CalculatePlayerView
 
+	idEntityPtr<idAnimatedEntity>	offHandWorldModel;	// left hand viewmodel entity, owned by the player
+	idStr					offHandDefName;		// entityDef it was spawned from
+	bool					offHandActive;		// shown and following the view
+
 	int						bobFoot;
 	float					bobFrac;
 	float					bobfracsin;
@@ -783,6 +802,7 @@ private:
 
 	void					UseObjects( void );
 	void					CrashLand( const idVec3 &oldOrigin, const idVec3 &oldVelocity );
+	virtual void			PlayFootStepSound( void );	// also the stealth noise of the step
 	void					BobCycle( const idVec3 &pushVelocity );
 	void					UpdateViewAngles( void );
 	void					EvaluateControls( void );

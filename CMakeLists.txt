@@ -414,6 +414,7 @@ set(src_game
 	game/SecurityCamera.cpp
 	game/SmokeParticles.cpp
 	game/Sound.cpp
+	game/SoundProp.cpp
 	game/Target.cpp
 	game/Trigger.cpp
 	game/Weapon.cpp
