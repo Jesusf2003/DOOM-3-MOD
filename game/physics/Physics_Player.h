@@ -73,7 +73,7 @@ typedef struct playerPState_s {
 
 typedef enum {
 	VAULT_NONE,
-	VAULT_LOW,				// obstacle up to 38u: one continuous parabolic pass
+	VAULT_LOW,				// obstacle 24..56u: one continuous quadratic Bezier pass
 	VAULT_HIGH_GRAB,		// ledge grab phase 1: the hands hit the ledge, run-up speed is absorbed
 	VAULT_CLIMBING,			// ledge grab phase 2: pull up (EaseOutCubic)
 	VAULT_MANTLE			// ledge grab phase 3: over the edge, the run-up speed comes back (ease-in)
@@ -127,7 +127,7 @@ public:
 	int						GetVaultDurationMsec( void ) const;	// total duration, retained after completion for camera settling
 	const idVec3 &			GetVaultLedgeNormal( void ) const { return vaultLedgeNormal; }
 	bool					IsVaultCrouched( void ) const { return vaultCrouched; }	// current or last vault was done crouched
-	bool					CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch = NULL, float probeDist = 40.0f, float *outWallDist = NULL, float *outArc = NULL );
+	bool					CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch = NULL, float probeDist = 40.0f, float *outWallDist = NULL, float *outArc = NULL, float carrySpeed = 0.0f );
 
 public:	// common physics interface
 	bool					Evaluate( int timeStepMSec, int endTimeMSec );
@@ -230,8 +230,9 @@ private:
 	float					vaultMoveSpeed;			// low: speed of the pass. ledge grab: speed handed back at the end
 	float					vaultAbsorbSpeed;		// ledge grab phase 1: speed towards the wall being absorbed
 	float					vaultAbsorbMax;			// ledge grab phase 1: distance left until the box touches the wall
-	float					vaultClearFrac;			// low vault: fraction of T after which the box is above the edge
-	float					vaultApproachDist;		// low vault: horizontal distance covered before that (gap to the face)
+	idVec3					vaultControlPos;		// low vault: control point of the quadratic Bezier pass
+	int						vaultGraceFrames;		// low vault: grounded frames left without ground friction after the landing
+	int						vaultGraceExpire;		// time after which that grace is dropped
 	int						vaultRiseMsec;			// ledge grab: duration of phase 2
 	int						vaultMantleMsec;		// ledge grab: duration of phase 3
 	bool					vaultWallContact;		// ledge grab: the box touched the wall, no more horizontal move until phase 3

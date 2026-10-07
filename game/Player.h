@@ -125,9 +125,9 @@ const float SLIDE_VIEW_BLEND_RATE = 12.0f;	// exponential ease rate of the slide
 const float SLIDE_VIEW_ROLL = 3.0f;			// camera leans into the turn this many degrees when steering a slide
 
 // vault camera (pitch in id convention: positive looks down)
-const float VAULT_VIEW_LOW_PITCH = 2.5f;		// low vault: inertia kick, looks up this much right after take off
-const float VAULT_VIEW_LOW_PITCH_PEAK = 0.3f;	// low vault: fraction of the pass where that kick peaks, then eases back
-const float VAULT_VIEW_LOW_ROLL = 3.0f;		// low vault: shoulder wobble, one side then the other
+const float VAULT_VIEW_LOW_PITCH = 2.0f;		// low vault: sharp downward dip at take off, the upper body driven over the edge
+const float VAULT_VIEW_LOW_DIP_MSEC = 50.0f;	// low vault: time to reach that dip, then it eases back to level by the landing
+const float VAULT_VIEW_LOW_ROLL = 3.0f;		// low vault: roll towards the side the obstacle is taken at (none head on)
 const float VAULT_VIEW_LAND_PITCH = 1.5f;		// landing on top of the obstacle: short downward nod
 const int VAULT_VIEW_LAND_MSEC = 200;			// duration of that nod (the longer vaults need a softer settle)
 const float VAULT_VIEW_ORIGIN_RATE = 16.0f;	// ease rate of the camera height during and right after a vault (eases in and out, ~60 ms lag)
@@ -135,6 +135,8 @@ const float VAULT_VIEW_GRAB_PITCH = 2.5f;		// ledge grab: looks down when the ha
 const float VAULT_VIEW_HIGH_ROLL = 3.0f;		// ledge grab at an angle to the wall: shoulder roll
 const float VAULT_VIEW_YAW_ALIGN = 4.0f;		// ledge grab phase 1: the view turns at most this much to face the wall
 const float VAULT_VIEW_BLEND_RATE = 14.0f;	// how fast the camera settles if a vault is cut short (ledge jump, teleport)
+const float VAULT_VIEW_FOV_BOOST = 3.5f;		// fov impulse: instant on the first frame of a low vault, eased in over a ledge grab mantle
+const float VAULT_VIEW_FOV_DECAY_MSEC = 250.0f;	// ease-out back to the normal fov once the vault is over
 
 // half size of the box swept from the body to the final camera position (idPlayerView::ClampCameraToWorld).
 // It grows with the fov to always contain the near clip plane, so that can't poke through walls either
@@ -505,6 +507,7 @@ public:
 	bool					IsVaulting( void ) const { return physicsObj.IsVaulting(); }
 	vaultState_t			GetVaultState( void ) const { return physicsObj.GetVaultState(); }
 	void					UpdateVaultView( int msec );
+	void					PlayVaultSound( const char *soundName, const char *fallbackName, soundType_t noiseType, float noiseVolume );
 	float					GetVaultViewPitch( void ) const { return vaultViewPitch + vaultLandPitch; }
 	float					GetVaultViewZOffset( void ) const { return vaultViewZOffset; }
 	float					GetVaultViewRoll( void ) const { return vaultViewRoll; }
@@ -677,6 +680,9 @@ private:
 	float					vaultSmoothedEyeZ;	// eased camera height along the up axis
 	float					vaultLastEyeZ;		// eye height along the up axis last frame
 	float					vaultViewZOffset;	// eased minus real camera height, applied in idPlayerView::CalculatePlayerView
+	float					vaultFovOffset;		// fov impulse of the vault push off, added in CalcFov
+	float					vaultFovExitValue;	// vaultFovOffset when the vault ended, start of the ease-out
+	int						vaultFovExitTime;	// when that ease-out started, 0 while the impulse is held or built up
 
 	idEntityPtr<idAnimatedEntity>	offHandWorldModel;	// left hand viewmodel entity, owned by the player
 	idStr					offHandDefName;		// entityDef it was spawned from

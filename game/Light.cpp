@@ -1156,3 +1156,257 @@ bool idLight::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
 
 	return idEntity::ClientReceiveEvent( event, time, msg );
 }
+
+/*
+===============================================================================
+
+  idLightEnvironment
+
+===============================================================================
+*/
+
+CLASS_DECLARATION( idLight, idLightEnvironment )
+END_CLASS
+
+// extra space around the world bounds so surfaces on the boundary are fully inside the light box
+static const float LIGHT_ENVIRONMENT_PADDING = 64.0f;
+
+/*
+================
+idLightEnvironment::idLightEnvironment
+================
+*/
+idLightEnvironment::idLightEnvironment() {
+	memset( &ambientLight, 0, sizeof( ambientLight ) );
+	sunDirection.Set( 0.0f, 0.0f, -1.0f );
+	ambientColor.Zero();
+	lightBounds.Zero();
+	ambientDefHandle	= -1;
+	ambientScale		= -1.0f;
+}
+
+/*
+================
+idLightEnvironment::~idLightEnvironment
+================
+*/
+idLightEnvironment::~idLightEnvironment() {
+	if ( ambientDefHandle != -1 ) {
+		gameRenderWorld->FreeLightDef( ambientDefHandle );
+	}
+}
+
+/*
+================
+idLightEnvironment::Spawn
+
+idLight::Spawn has already parsed the generic light keys (texture, levels,
+start_off, ...), we only override what makes this a world-wide light
+================
+*/
+void idLightEnvironment::Spawn( void ) {
+	ParseEnvironmentArgs( &spawnArgs );
+	SetupSunLight();
+	SetupAmbientLight( &spawnArgs );
+	UpdateVisuals();
+}
+
+/*
+================
+idLightEnvironment::ParseEnvironmentArgs
+
+  "color"    sun color, falls back to the standard "_color" key
+  "ambient"  ambient fill, either "r g b" or a single gray intensity
+  "angles"   "pitch yaw roll" of the sunlight, positive pitch points down
+  "env_mins" / "env_maxs"  optional volume override, defaults to the world bounds
+================
+*/
+void idLightEnvironment::ParseEnvironmentArgs( const idDict *args ) {
+	idVec3 sunColor;
+	if ( !args->GetVector( "color", "", sunColor ) ) {
+		args->GetVector( "_color", "1 1 1", sunColor );
+	}
+	// SetLightLevel derives the sun's shaderParms from baseColor
+	baseColor = sunColor;
+
+	ambientColor.Zero();
+	const char *ambientStr = args->GetString( "ambient", "0.1 0.1 0.1" );
+	int numComponents = sscanf( ambientStr, "%f %f %f", &ambientColor.x, &ambientColor.y, &ambientColor.z );
+	if ( numComponents == 1 ) {
+		ambientColor.y = ambientColor.z = ambientColor.x;
+	} else if ( numComponents != 3 ) {
+		gameLocal.Warning( "light_environment '%s': bad ambient value '%s'", name.c_str(), ambientStr );
+		ambientColor.Zero();
+	}
+
+	idAngles angles = args->GetAngles( "angles", "60 30 0" );
+	sunDirection = angles.ToForward();
+	if ( sunDirection.Normalize() == 0.0f ) {
+		sunDirection.Set( 0.0f, 0.0f, -1.0f );
+	}
+
+	idVec3 mins, maxs;
+	if ( args->GetVector( "env_mins", "", mins ) && args->GetVector( "env_maxs", "", maxs ) ) {
+		lightBounds.Clear();
+		lightBounds.AddPoint( mins );
+		lightBounds.AddPoint( maxs );
+	} else {
+		lightBounds = gameLocal.clip.GetWorldBounds();
+		if ( lightBounds.IsCleared() ) {
+			gameLocal.Warning( "light_environment '%s': no world bounds, using a default volume", name.c_str() );
+			lightBounds = idBounds( idVec3( -8192.0f, -8192.0f, -8192.0f ), idVec3( 8192.0f, 8192.0f, 8192.0f ) );
+		}
+		lightBounds.ExpandSelf( LIGHT_ENVIRONMENT_PADDING );
+	}
+}
+
+/*
+================
+idLightEnvironment::SetupSunLight
+
+turns the inherited renderLight into a world-aligned parallel box light
+================
+*/
+void idLightEnvironment::SetupSunLight( void ) {
+	renderLight.pointLight		= true;		// box volume, projected lights use a frustum
+	renderLight.parallel		= true;		// lightCenter is the direction towards the light at infinity
+	renderLight.noShadows		= true;		// never build stencil shadow volumes for this light
+	renderLight.prelightModel	= NULL;		// and never use precomputed ones either
+
+	renderLight.origin			= lightBounds.GetCenter();
+	renderLight.axis			= mat3_identity;
+	renderLight.lightRadius		= ( lightBounds[1] - lightBounds[0] ) * 0.5f;
+	// for parallel lights the renderer reads lightCenter as a world space direction,
+	// so the interaction program gets L = -sunDirection for every pixel
+	renderLight.lightCenter		= -sunDirection;
+
+	// keep the volume fixed in the world no matter where the editor gizmo is placed
+	localLightOrigin = ( renderLight.origin - GetPhysics()->GetOrigin() ) * GetPhysics()->GetAxis().Transpose();
+	localLightAxis = renderLight.axis * GetPhysics()->GetAxis().Transpose();
+
+	// applies baseColor * current level and presents the light def
+	SetLightLevel();
+}
+
+/*
+================
+idLightEnvironment::SetupAmbientLight
+
+the fill light shares the sun's volume, but uses an ambientLight material
+================
+*/
+void idLightEnvironment::SetupAmbientLight( const idDict *args ) {
+	ambientLight				= renderLight;
+	ambientLight.parallel		= false;
+	ambientLight.lightCenter.Zero();
+	ambientLight.noShadows		= true;
+	ambientLight.noSpecular		= true;
+	ambientLight.prelightModel	= NULL;
+	ambientLight.referenceSound	= NULL;
+	ambientLight.shader			= declManager->FindMaterial( args->GetString( "mat_ambient", "lights/environment_ambient" ) );
+
+	// force PresentAmbient to push the new parms
+	ambientScale = -1.0f;
+}
+
+/*
+================
+idLightEnvironment::PresentAmbient
+
+the fill light follows the sun's current intensity, so On/Off, levels
+and fades dim both lights together
+================
+*/
+void idLightEnvironment::PresentAmbient( void ) {
+	idVec4 sunColor;
+	GetColor( sunColor );
+
+	float baseSum = baseColor.x + baseColor.y + baseColor.z;
+	float scale = ( baseSum > 0.0f ) ? ( sunColor.x + sunColor.y + sunColor.z ) / baseSum : 1.0f;
+
+	if ( ambientDefHandle != -1 && scale == ambientScale ) {
+		return;
+	}
+	ambientScale = scale;
+
+	ambientLight.shaderParms[ SHADERPARM_RED ]		= ambientColor.x * scale;
+	ambientLight.shaderParms[ SHADERPARM_GREEN ]	= ambientColor.y * scale;
+	ambientLight.shaderParms[ SHADERPARM_BLUE ]		= ambientColor.z * scale;
+
+	if ( ambientDefHandle != -1 ) {
+		gameRenderWorld->UpdateLightDef( ambientDefHandle, &ambientLight );
+	} else {
+		ambientDefHandle = gameRenderWorld->AddLightDef( &ambientLight );
+	}
+}
+
+/*
+================
+idLightEnvironment::Think
+================
+*/
+void idLightEnvironment::Think( void ) {
+	idLight::Think();
+	PresentAmbient();
+}
+
+/*
+================
+idLightEnvironment::FreeLightDef
+================
+*/
+void idLightEnvironment::FreeLightDef( void ) {
+	idLight::FreeLightDef();
+	if ( ambientDefHandle != -1 ) {
+		gameRenderWorld->FreeLightDef( ambientDefHandle );
+		ambientDefHandle = -1;
+	}
+}
+
+/*
+================
+idLightEnvironment::UpdateChangeableSpawnArgs
+
+idLight re-parses renderLight from the dict, so the environment setup has to be reapplied
+================
+*/
+void idLightEnvironment::UpdateChangeableSpawnArgs( const idDict *source ) {
+	idLight::UpdateChangeableSpawnArgs( source );
+
+	const idDict *args = source ? source : &spawnArgs;
+	ParseEnvironmentArgs( args );
+	SetupSunLight();
+	SetupAmbientLight( args );
+	UpdateVisuals();
+}
+
+/*
+================
+idLightEnvironment::Save
+================
+*/
+void idLightEnvironment::Save( idSaveGame *savefile ) const {
+	savefile->WriteVec3( sunDirection );
+	savefile->WriteVec3( ambientColor );
+	savefile->WriteBounds( lightBounds );
+	savefile->WriteRenderLight( ambientLight );
+}
+
+/*
+================
+idLightEnvironment::Restore
+================
+*/
+void idLightEnvironment::Restore( idRestoreGame *savefile ) {
+	savefile->ReadVec3( sunDirection );
+	savefile->ReadVec3( ambientColor );
+	savefile->ReadBounds( lightBounds );
+	savefile->ReadRenderLight( ambientLight );
+
+	ambientLight.prelightModel	= NULL;
+	ambientLight.referenceSound	= NULL;
+	ambientDefHandle			= -1;
+	ambientScale				= -1.0f;
+
+	UpdateVisuals();
+}

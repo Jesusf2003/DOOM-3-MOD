@@ -1011,6 +1011,9 @@ idPlayer::idPlayer() {
 	vaultSmoothedEyeZ		= 0.0f;
 	vaultLastEyeZ			= 0.0f;
 	vaultViewZOffset		= 0.0f;
+	vaultFovOffset		= 0.0f;
+	vaultFovExitValue	= 0.0f;
+	vaultFovExitTime	= 0;
 
 	weapon					= NULL;
 
@@ -1385,6 +1388,9 @@ void idPlayer::Init( void ) {
 	vaultSmoothedEyeZ = 0.0f;
 	vaultLastEyeZ = 0.0f;
 	vaultViewZOffset = 0.0f;
+	vaultFovOffset = 0.0f;
+	vaultFovExitValue = 0.0f;
+	vaultFovExitTime = 0;
 
 	stepUpTime = 0;
 	stepUpDelta = 0.0f;
@@ -2201,6 +2207,9 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	vaultSmoothedEyeZ = 0.0f;
 	vaultLastEyeZ = 0.0f;
 	vaultViewZOffset = 0.0f;
+	vaultFovOffset = 0.0f;
+	vaultFovExitValue = 0.0f;
+	vaultFovExitTime = 0;
 
 	// DG: workaround for lingering messages that are shown forever after loading a savegame
 	//     (one way to get them is saving again, while the message from first save is still
@@ -6584,7 +6593,8 @@ void idPlayer::UpdateCrouchState( int msec ) {
 idPlayer::UpdateVaultView
 
 Procedural camera for vaults, computed from the phase progress so it never stops or jumps:
-  low vault:  looks up on take off, down over the edge, subtle shoulder sway, all back to 0 on landing
+  low vault:  sharp downward dip at take off, roll by the entry angle, both back to 0 on landing;
+              instant fov kick, eased out after the landing
   ledge grab: looks down as the hands hit (and turns a few degrees to face the wall), back to level
               while pulling up, shoulder roll when climbing at an angle
 ==============
@@ -6627,9 +6637,20 @@ void idPlayer::UpdateVaultView( int msec ) {
 	}
 	vaultLastEyeZ = eyeZ;
 
-	// landing nod when a vault ends on top of the obstacle (not when it was cut short by a ledge jump)
+	// take off / hands hitting the ledge: no hands or anims to show it, so it's all in the sound
+	const bool crouchedVault = physicsObj.IsVaultCrouched();
+	if ( !vaultWasActive && state != VAULT_NONE ) {
+		if ( state == VAULT_LOW ) {
+			PlayVaultSound( "snd_vault", "snd_footstep", SND_TYPE_FOOTSTEP, crouchedVault ? SOUNDPROP_VOLUME_CROUCH : SOUNDPROP_VOLUME_RUN );
+		} else {
+			PlayVaultSound( "snd_vault_grab", "snd_footstep", SND_TYPE_IMPACT, crouchedVault ? SOUNDPROP_VOLUME_CROUCH : SOUNDPROP_VOLUME_LAND_SOFT );
+		}
+	}
+
+	// landing nod and sound when a vault ends on top of the obstacle (not when it was cut short by a ledge jump)
 	if ( vaultWasActive && state == VAULT_NONE && !physicsObj.HasJumped() ) {
 		vaultLandTime = gameLocal.time;
+		PlayVaultSound( "snd_vault_land", "snd_land_soft", SND_TYPE_IMPACT, crouchedVault ? SOUNDPROP_VOLUME_CROUCH : SOUNDPROP_VOLUME_LAND_SOFT );
 	}
 	vaultWasActive = ( state != VAULT_NONE );
 	const int landMsec = Max( 1, idMath::Ftoi( VAULT_VIEW_LAND_MSEC * durationScale ) );
@@ -6637,6 +6658,28 @@ void idPlayer::UpdateVaultView( int msec ) {
 		vaultLandPitch = VAULT_VIEW_LAND_PITCH * idMath::Sin( idMath::PI * ( gameLocal.time - vaultLandTime ) / (float)landMsec );
 	} else {
 		vaultLandPitch = 0.0f;
+	}
+
+	// fov impulse: a low vault kicks it in full on its first frame (sudden speed), a ledge grab builds it
+	// up over the mantle (the run-up speed coming back). Held for the whole move, then an ease-out over
+	// VAULT_VIEW_FOV_DECAY_MSEC from wherever it was. Not in the tight spaces of a crouched vault
+	if ( state == VAULT_LOW && !crouchedVault ) {
+		vaultFovOffset = VAULT_VIEW_FOV_BOOST;
+		vaultFovExitTime = 0;
+	} else if ( state == VAULT_MANTLE && !crouchedVault ) {
+		vaultFovOffset = VAULT_VIEW_FOV_BOOST * u * u * ( 3.0f - 2.0f * u );
+		vaultFovExitTime = 0;
+	} else if ( vaultFovOffset > 0.0f ) {
+		if ( !vaultFovExitTime ) {
+			vaultFovExitTime = gameLocal.time;
+			vaultFovExitValue = vaultFovOffset;
+		}
+		const float k = idMath::ClampFloat( 0.0f, 1.0f, ( gameLocal.time - vaultFovExitTime ) / VAULT_VIEW_FOV_DECAY_MSEC );
+		vaultFovOffset = vaultFovExitValue * ( 1.0f - k ) * ( 1.0f - k ) * ( 1.0f - k );
+		if ( k >= 1.0f ) {
+			vaultFovOffset = 0.0f;
+			vaultFovExitTime = 0;
+		}
 	}
 
 	if ( state == VAULT_NONE ) {
@@ -6662,20 +6705,26 @@ void idPlayer::UpdateVaultView( int msec ) {
 
 	switch ( state ) {
 		case VAULT_LOW: {
-			// inertia kick: eases up to VAULT_VIEW_LOW_PITCH (looking up) shortly after take off, then eases
-			// back to level as the body settles on top; both ends have zero slope
-			float kick;
-			if ( u < VAULT_VIEW_LOW_PITCH_PEAK ) {
-				const float k = u / VAULT_VIEW_LOW_PITCH_PEAK;
-				kick = k * k * ( 3.0f - 2.0f * k );
+			// timed in ms rather than by progress so the dip stays sharp however short the pass is:
+			// dips down to VAULT_VIEW_LOW_PITCH in the first VAULT_VIEW_LOW_DIP_MSEC (momentum driving the
+			// upper body over the edge), then eases back to level by the landing
+			const float elapsed = u * vaultDuration;
+			const float dipMsec = Min( VAULT_VIEW_LOW_DIP_MSEC, 0.5f * vaultDuration );
+			const float restMsec = Max( vaultDuration - dipMsec, 1.0f );
+			float dip;
+			if ( elapsed < dipMsec ) {
+				const float k = elapsed / dipMsec;
+				dip = k * k * ( 3.0f - 2.0f * k );
 			} else {
-				kick = 0.5f * ( 1.0f + idMath::Cos( idMath::PI * ( u - VAULT_VIEW_LOW_PITCH_PEAK ) / ( 1.0f - VAULT_VIEW_LOW_PITCH_PEAK ) ) );
+				const float k = idMath::ClampFloat( 0.0f, 1.0f, ( elapsed - dipMsec ) / restMsec );
+				dip = 1.0f - k * k * ( 3.0f - 2.0f * k );
 			}
-			vaultViewPitch = -VAULT_VIEW_LOW_PITCH * kick;
-			// wobble: leads with the shoulder on the side of the approach (the right one when going straight
-			// at it), swings to the other side, zero at both ends. 0.77 is the peak of sin(2 pi u) sin(pi u)
-			const float sway = ( side < -0.05f ) ? -1.0f : 1.0f;
-			vaultViewRoll = VAULT_VIEW_LOW_ROLL * sway * idMath::Sin( idMath::TWO_PI * u ) * idMath::Sin( idMath::PI * u ) / 0.77f;
+			vaultViewPitch = VAULT_VIEW_LOW_PITCH * dip;
+			// right after the dip, a quick roll towards the side the obstacle was taken at, scaled by the
+			// entry angle (none head on), back to 0 on landing
+			const float rollAngle = VAULT_VIEW_LOW_ROLL * idMath::ClampFloat( -1.0f, 1.0f, side * 2.0f );
+			const float rk = idMath::ClampFloat( 0.0f, 1.0f, ( elapsed - dipMsec ) / restMsec );
+			vaultViewRoll = rollAngle * idMath::Sin( idMath::PI * rk );
 			break;
 		}
 		case VAULT_HIGH_GRAB:
@@ -6717,6 +6766,21 @@ void idPlayer::UpdateVaultView( int msec ) {
 			vaultYawApplied = wanted;
 		}
 	}
+}
+
+/*
+==============
+idPlayer::PlayVaultSound
+
+Vault sounds come from the player def like every other player sound. The vault keys are optional,
+without them the stock footstep / landing sounds are used. Also emits the stealth noise of the move.
+==============
+*/
+void idPlayer::PlayVaultSound( const char *soundName, const char *fallbackName, soundType_t noiseType, float noiseVolume ) {
+	if ( !StartSound( soundName, SND_CHANNEL_ANY, 0, false, NULL ) ) {
+		StartSound( fallbackName, SND_CHANNEL_ANY, 0, false, NULL );
+	}
+	gameLocal.EmitSoundEvent( GetPhysics()->GetOrigin(), noiseVolume + GetGroundSoundModifier(), noiseType, this );
 }
 
 /*
@@ -7961,7 +8025,7 @@ float idPlayer::CalcFov( bool honorZoom ) {
 		if ( ( honorZoom && usercmd.buttons & BUTTON_ZOOM ) && weapon.GetEntity() ) {
 			fov = weapon.GetEntity()->GetZoomFov();
 		} else {
-			fov = DefaultFov() + playerView.GetSprintFovOffset();
+			fov = DefaultFov() + playerView.GetSprintFovOffset() + vaultFovOffset;
 		}
 	} else {
 		fov = zoomFov.GetCurrentValue( gameLocal.time );

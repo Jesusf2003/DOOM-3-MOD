@@ -88,10 +88,16 @@ const float PM_VAULT_MAX_ANGLE_COS	= 0.7071f;	// forward . -wallNormal, cos( 45 
 const float PM_VAULT_MAX_WALL_SLOPE	= 0.3f;		// the obstacle face must be close to vertical (|normal . up| below this)
 const float PM_VAULT_LEDGE_INSET	= 6.0f;		// the top is probed this far behind the face
 const float PM_VAULT_MIN_LEDGE_NORMAL	= 0.7f;	// the top must be walkable
-const float PM_VAULT_LOW_MAX_HEIGHT	= 38.0f;	// up to this height: low vault (continuous pass), above: ledge grab
+const float PM_VAULT_MIN_HEIGHT		= 24.0f;	// lower obstacles are left to step up / a regular jump
+const float PM_VAULT_LOW_MAX_HEIGHT	= 56.0f;	// up to this height: low vault (continuous pass), above: ledge grab
 const float PM_VAULT_LAND_INSET		= 2.0f;		// the back of the box ends this far past the edge
 const float PM_VAULT_TARGET_CLEARANCE	= 2.0f;		// kinematic moves end this far above the top, gravity settles the rest
 const int PM_VAULT_COOLDOWN_MSEC	= 300;		// no new vault right after one ends
+const float PM_VAULT_EXIT_BOOST	= 1.15f;	// low vault: run-up speed handed back times this (never above pm_runspeed times this)
+const float PM_VAULT_LAND_EXTEND_MAX	= 48.0f;	// low vault: the landing may be pushed this far past the edge...
+const float PM_VAULT_LAND_EXTEND_STEP	= 8.0f;		// ...backing off in steps of this when there's no room
+const int PM_VAULT_GRACE_FRAMES	= 3;		// low vault: grounded frames without ground friction after the landing
+const int PM_VAULT_GRACE_MAX_MSEC	= 250;		// that grace is dropped if the ground isn't reached within this
 const int PM_VAULT_OVERTIME_MSEC	= 150;		// extra time for a low vault to reach its landing spot if the arc was blocked
 const float PM_VAULT_SWEEP_STEP		= 4.0f;		// the kinematic move of a frame is swept in substeps of at most this length
 const float PM_VAULT_CEILING_GAP	= 1.0f;		// crouched under a low ceiling, the probes run this far below it
@@ -107,8 +113,9 @@ const float PM_VAULT_LOW_WALK_SPEED		= 140.0f;
 const float PM_VAULT_LOW_SPRINT_SPEED	= 200.0f;
 const int PM_VAULT_LOW_CROUCH_MSEC		= 490;
 const int PM_VAULT_LOW_WALK_MSEC			= 405;
-const int PM_VAULT_LOW_SPRINT_MSEC		= 270;
-const float PM_VAULT_LOW_ARC		= 10.0f;	// H_clearance: the arc peaks this far above the edge
+const int PM_VAULT_LOW_SPRINT_MSEC		= 200;
+const float PM_VAULT_LOW_ARC		= 5.0f;		// H_clearance: the arc peaks this far above the edge (kept flat: a glide, not a hop)
+const float PM_VAULT_BEZIER_MAX_DIP	= 5.0f;		// low vault: the pass may pull back this far while rising, to clear the edge before the face
 
 // ledge grab (VAULT_HIGH_GRAB -> VAULT_CLIMBING -> VAULT_MANTLE). The total of the three phases only
 // depends on the ledge height and is split between them with the fractions below
@@ -538,6 +545,14 @@ void idPhysics_Player::Friction( void ) {
 	}
 	// apply ground friction
 	else if ( walking && waterLevel <= WATERLEVEL_FEET ) {
+		// right after a low vault the landing doesn't brake: the exit speed carries into the run
+		if ( vaultGraceFrames > 0 ) {
+			if ( gameLocal.time < vaultGraceExpire ) {
+				vaultGraceFrames--;
+				return;
+			}
+			vaultGraceFrames = 0;
+		}
 		// no friction on slick surfaces
 		if ( !(groundMaterial && groundMaterial->GetSurfaceFlags() & SURF_SLICK) ) {
 			// if getting knocked back, no friction
@@ -1483,11 +1498,14 @@ fits there (standing or crouched) and that the way there is free for the move th
 used: the arc of a low vault or the straight pull up of a ledge grab.
 A crouched player vaults as is: the probes stay under a low ceiling and the way is checked with
 the crouch sized box, so there is no need to stand up first.
-outTargetPos is where the player ends up standing: on top, just past the edge.
+outTargetPos is where the player ends up standing: on top, just past the edge. For a low vault
+with a carrySpeed it is pushed further forward (see below).
 outArc is how far above the edge a low vault passes.
 ================
 */
-bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch, float probeDist, float *outWallDist, float *outArc ) {
+static int LowVaultTiming( float speed, bool crouched );
+
+bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &outTargetPos, vaultState_t &outType, bool *outCrouch, float probeDist, float *outWallDist, float *outArc, float carrySpeed ) {
 	trace_t			waistTrace, headTrace, topTrace, ledgeTrace, ceilingTrace, openingTrace, openingWall;
 	const trace_t *	wall;
 	idVec3			up, forward, start, flat, ledgeSpot, standSpot, peak;
@@ -1587,6 +1605,9 @@ bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &out
 		return false;
 	}
 	ledgeHeight = ( ledgeTrace.endpos - current.origin ) * up;
+	if ( ledgeHeight < PM_VAULT_MIN_HEIGHT ) {
+		return false;
+	}
 	outType = ( ledgeHeight <= PM_VAULT_LOW_MAX_HEIGHT ) ? VAULT_LOW : VAULT_HIGH_GRAB;
 
 	// 4. the box must fit on top, just past the edge, with PM_VAULT_FIT_MARGIN to spare: standing, or at
@@ -1619,6 +1640,24 @@ bool idPhysics_Player::CheckVaultOpportunity( trace_t &outWallTrace, idVec3 &out
 		}
 		if ( !found ) {
 			return false;
+		}
+
+		// stretch the landing forward so the pass covers what the run-up speed would in the same time:
+		// the vault crosses at the entry speed (a glide) instead of braking on top or dashing over. The
+		// spot backs off towards the edge while the box doesn't fit or the way there isn't free
+		if ( carrySpeed > 0.0f ) {
+			idVec3 nearFlat = standSpot - current.origin;
+			nearFlat -= ( nearFlat * up ) * up;
+			const float extend = Min( carrySpeed * MS2SEC( LowVaultTiming( carrySpeed, crouch ) ) - nearFlat.Length(), PM_VAULT_LAND_EXTEND_MAX );
+			pathBounds = PlayerBounds( crouch );
+			const idBounds fitBounds = pathBounds.Expand( PM_VAULT_FIT_MARGIN );
+			for ( float ext = extend; ext > 0.5f; ext -= PM_VAULT_LAND_EXTEND_STEP ) {
+				const idVec3 spot = standSpot + forward * ext;
+				if ( VaultBoxFits( spot, fitBounds, clipMask, self ) && LowVaultPathClear( current.origin, spot, up, ledgeHeight, arc, pathBounds, clipMask, self ) ) {
+					standSpot = spot;
+					break;
+				}
+			}
 		}
 	} else {
 		// ledge grabs pull straight up along the wall, then over the edge. A crouched player keeps
@@ -1680,14 +1719,48 @@ static int LowVaultTiming( float speed, bool crouched ) {
 
 /*
 ================
-LowVaultClearFrac
+LowVaultBezierControl
 
-With Z(t) = (H + C) sin( pi t / T ) the bottom of the box is above the edge only after this fraction
-of T: asin( Hedge / ( H + C ) ) / pi. The box must not reach the face before then.
+Control point of the low vault's quadratic Bezier P(u) = (1-u)^2 S + 2(1-u)u C + u^2 E, as
+( along, up ) offsets from S. E is ( dist, height ).
+
+Up: the curve peaks at c^2 / ( 2c - H ), solving that for a peak of H + arc gives
+c = P + sqrt( P * arc ) with P = H + arc. The peak comes after the middle of the pass, so the
+body is still rising when it reaches the edge and only settles at the very end.
+
+Along: C at dist / 2 makes the horizontal motion linear. It is pulled back when that would make
+the front of the box reach the face (approachDist) before the bottom is above the edge
+(edgeHeight). Standing right against the face that needs C behind the start, so the body draws
+back a little while it rises (at most PM_VAULT_BEZIER_MAX_DIP). Only the highest obstacles taken
+from right against the face, or the flat arc under a low ceiling, need more: VaultSweep guards
+whatever is left.
 ================
 */
-static float LowVaultClearFrac( float height, float edgeHeight, float arc ) {
-	return idMath::ASin( idMath::ClampFloat( 0.0f, 1.0f, edgeHeight / ( height + arc ) ) ) / idMath::PI;
+static void LowVaultBezierControl( float dist, float height, float edgeHeight, float arc, float approachDist,
+		float &outAlong, float &outUp ) {
+	const float peak = height + arc;
+	const float c = peak + idMath::Sqrt( peak * Max( arc, 0.0f ) );
+	outUp = c;
+
+	// first u where the bottom of the box is level with the edge: ( H - 2c ) u^2 + 2c u - edge = 0
+	const float k = 2.0f * c - height;
+	const float disc = 4.0f * c * c - 4.0f * k * edgeHeight;
+	if ( k <= 0.0f || disc < 0.0f ) {
+		outAlong = 0.5f * dist;
+		return;
+	}
+	const float uClear = ( 2.0f * c - idMath::Sqrt( disc ) ) / ( 2.0f * k );
+
+	// x( uClear ) = 2 uClear ( 1 - uClear ) along + uClear^2 dist must not pass approachDist
+	float along = 0.5f * dist;
+	const float b = 2.0f * uClear * ( 1.0f - uClear );
+	if ( b > 0.0001f ) {
+		along = Min( along, ( approachDist - uClear * uClear * dist ) / b );
+	}
+	// the lowest point of x( u ) for along < 0 is -along^2 / ( dist - 2 along ): keep it within the max dip
+	const float m = PM_VAULT_BEZIER_MAX_DIP;
+	const float minAlong = -m - idMath::Sqrt( m * m + m * dist );
+	outAlong = idMath::ClampFloat( minAlong, 0.5f * dist, along );
 }
 
 /*
@@ -1734,7 +1807,7 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 	if ( walking ) {
 		probeDist += flatVelocity.Length() * MS2SEC( vaultInputBuffer - gameLocal.time );
 	}
-	if ( !idPhysics_Player::CheckVaultOpportunity( wallTrace, standSpot, type, &crouch, probeDist, &wallDist, &arc ) ) {
+	if ( !idPhysics_Player::CheckVaultOpportunity( wallTrace, standSpot, type, &crouch, probeDist, &wallDist, &arc, flatVelocity.Length() ) ) {
 		return false;
 	}
 	up = -gravityNormal;
@@ -1788,8 +1861,11 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 		// and finish together. The run-up speed comes back when the pass ends
 		const float edgeHeight = vaultLedgeHeight - PM_VAULT_TARGET_CLEARANCE;
 		const int passMsec = LowVaultTiming( flatVelocity.Length(), vaultCrouched );
-		vaultClearFrac = LowVaultClearFrac( vaultLedgeHeight, edgeHeight, vaultArc );
-		vaultApproachDist = Max( 0.0f, flatDist - ( 2.0f * halfWidth + PM_VAULT_LAND_INSET ) );
+		// the landing may have been stretched forward, the face is where the probe found it
+		const float approachDist = Max( 0.0f, wallDist - halfWidth );
+		float controlAlong, controlUp;
+		LowVaultBezierControl( flatDist, vaultLedgeHeight, edgeHeight, vaultArc, approachDist, controlAlong, controlUp );
+		vaultControlPos = current.origin + vaultForward * controlAlong + up * controlUp;
 		vaultMoveSpeed = flatDist / MS2SEC( passMsec );
 		vaultTargetPos = standSpot;
 		vaultTimer = vaultStartTime + passMsec;
@@ -1840,7 +1916,7 @@ bool idPhysics_Player::CheckVaultStart( void ) {
 ================
 idPhysics_Player::ProcessVault
 
-VAULT_LOW:       one continuous parabolic pass over the obstacle, fixed duration by height.
+VAULT_LOW:       one continuous quadratic Bezier pass over the obstacle, duration by run-up speed.
 VAULT_HIGH_GRAB: phase 1, the hands hit the ledge and the run-up speed dies off exponentially.
 VAULT_CLIMBING:  phase 2, pull up with EaseOutCubic: fast start, soft arrival above the edge.
 VAULT_MANTLE:    phase 3, move over the edge accelerating from 0 back to the run-up speed.
@@ -1849,7 +1925,7 @@ Each step is swept with the player box (VaultSweep) so it can never end up insid
 */
 void idPhysics_Player::ProcessVault( int msec ) {
 	idVec3	up, oldOrigin, desired, toTarget;
-	float	u, s, remaining;
+	float	u, s;
 
 	up = -gravityNormal;
 	oldOrigin = current.origin;
@@ -1886,24 +1962,10 @@ void idPhysics_Player::ProcessVault( int msec ) {
 
 	switch ( currentVaultState ) {
 		case VAULT_LOW: {
-			// Z(t) = Zstart + (H + clearance) * sin( pi * t / T ) while rising, then H + clearance * sin( pi * t / T )
-			// so the peak is vaultArc over the edge and the pass lands on top instead of back at Zstart
-			s = idMath::Sin( idMath::PI * u );
-			const float height = ( u < 0.5f ? vaultLedgeHeight * s : vaultLedgeHeight ) + vaultArc * s;
-			// XY is on the same clock as the arc: the gap to the face is covered by the time the box
-			// clears the edge (vaultClearFrac), its own depth over the top in the rest of T, so it never
-			// stops against the obstacle and lands exactly at T whatever the start distance was
-			toTarget = vaultTargetPos - vaultStartPos;
-			toTarget -= ( toTarget * up ) * up;
-			remaining = toTarget.Length();
-			float along;
-			if ( u < vaultClearFrac ) {
-				along = vaultApproachDist * ( u / vaultClearFrac );
-			} else {
-				along = vaultApproachDist + ( remaining - vaultApproachDist ) * ( ( u - vaultClearFrac ) / Max( 1.0f - vaultClearFrac, 0.001f ) );
-			}
-			desired = vaultStartPos + vaultForward * along;
-			desired += up * ( ( vaultStartPos + up * height - desired ) * up );
+			// quadratic Bezier start -> control -> landing spot (see LowVaultBezierControl): peaks vaultArc
+			// over the edge, never reaches the face before clearing it, lands exactly at T
+			s = 1.0f - u;
+			desired = vaultStartPos * ( s * s ) + vaultControlPos * ( 2.0f * s * u ) + vaultTargetPos * ( u * u );
 			break;
 		}
 		case VAULT_HIGH_GRAB: {
@@ -2068,8 +2130,14 @@ void idPhysics_Player::EndVault( const bool keepMomentum ) {
 
 	if ( keepMomentum ) {
 		if ( vaultType == VAULT_LOW ) {
-			// low vaults give back 100% of the run-up velocity
-			current.velocity = vaultEntryVelocity;
+			// low vaults give back the run-up velocity with a small push off the obstacle, capped so
+			// chained vaults can't build speed beyond the boosted run speed
+			const float entrySpeed = vaultEntryVelocity.Length();
+			const float boostedSpeed = Min( entrySpeed * PM_VAULT_EXIT_BOOST, Max( entrySpeed, pm_runspeed.GetFloat() * PM_VAULT_EXIT_BOOST ) );
+			current.velocity = entrySpeed > 0.001f ? vaultEntryVelocity * ( boostedSpeed / entrySpeed ) : vaultEntryVelocity;
+			// and keep it through the landing: no ground friction for the first few grounded frames
+			vaultGraceFrames = PM_VAULT_GRACE_FRAMES;
+			vaultGraceExpire = gameLocal.time + PM_VAULT_GRACE_MAX_MSEC;
 		} else {
 			// ledge grabs end at the speed the mantle curve reached (the run-up speed if it was faster)
 			current.velocity = vaultForward * vaultMoveSpeed;
@@ -2729,8 +2797,9 @@ idPhysics_Player::idPhysics_Player( void ) {
 	vaultMoveSpeed = 0.0f;
 	vaultAbsorbSpeed = 0.0f;
 	vaultAbsorbMax = 0.0f;
-	vaultClearFrac = 0.0f;
-	vaultApproachDist = 0.0f;
+	vaultControlPos.Zero();
+	vaultGraceFrames = 0;
+	vaultGraceExpire = 0;
 	vaultRiseMsec = 0;
 	vaultMantleMsec = 0;
 	vaultWallContact = false;
