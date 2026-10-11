@@ -2,13 +2,26 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "dhewm3: Dunwall room",
+      "name": "dhewm3: compile map and run",
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}/bin/doom3.exe",
       "args": [
-        "+dmap", "dunwall/room",
-        "+map", "dunwall/room.map"
+        "+dmap", "dunwall/room_parkour",
+        "+map", "dunwall/room_parkour.map"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/bin",
+      "console": "externalTerminal",
+      "preLaunchTask": "CMake: build"
+    },
+    {
+      "name": "dhewm3: only run",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/bin/doom3.exe",
+      "args": [
+        "+map", "dunwall/room_parkour"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}/bin",

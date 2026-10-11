@@ -67,6 +67,10 @@ idPlayerView::idPlayerView() {
 	bloodSprayMaterial = declManager->FindMaterial( "textures/decals/bloodspray" );
 	bfgMaterial = declManager->FindMaterial( "textures/decals/bfgvision" );
 	lagoMaterial = declManager->FindMaterial( LAGO_MATERIAL, false );
+	crosshairCenterMaterial = declManager->FindMaterial( "guis/assets/common/crosshaircenter" );
+	crosshairCenter2Material = declManager->FindMaterial( "guis/assets/common/crosshaircenter2" );
+	crosshairLightMaterial = declManager->FindMaterial( "guis/assets/common/crosshairlight" );
+	crosshairFrameMaterial = declManager->FindMaterial( "guis/assets/common/crosshairframe" );
 	bfgVision = false;
 	dvFinishTime = 0;
 	kickFinishTime = 0;
@@ -599,7 +603,9 @@ void idPlayerView::SingleView( idUserInterface *hud, const renderView_t *view ) 
 
 	// draw screen blobs
 	if ( !pm_thirdPerson.GetBool() && !g_skipViewEffects.GetBool() ) {
-		for ( int i = 0 ; i < MAX_SCREEN_BLOBS ; i++ ) {
+		// blood on the eyes makes no sense with the camera behind the player, the rest of the HUD stays
+		const int numBlobs = player->UsesActionCamera() ? 0 : MAX_SCREEN_BLOBS;
+		for ( int i = 0 ; i < numBlobs ; i++ ) {
 			screenBlob_t	*blob = &screenBlobs[i];
 			if ( blob->finishTime <= gameLocal.time ) {
 				continue;
@@ -675,6 +681,74 @@ void idPlayerView::SingleView( idUserInterface *hud, const renderView_t *view ) 
 			renderSystem->DrawStretchPic( 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 0.0f, 1.0f, 1.0f, mtr );
 		}
 	}
+}
+
+/*
+===================
+idPlayerView::WorldToScreen
+
+Same projection the renderer uses for this view (fov_x / fov_y already carry the aspect ratio),
+mapped to the 640x480 virtual screen the HUD is drawn in.
+===================
+*/
+bool idPlayerView::WorldToScreen( const renderView_t *view, const idVec3 &point, idVec2 &screen ) {
+	const idVec3 delta = point - view->vieworg;
+	const float forward = delta * view->viewaxis[0];
+	if ( forward < 1.0f ) {
+		return false;
+	}
+
+	const float tanX = idMath::Tan( DEG2RAD( view->fov_x * 0.5f ) );
+	const float tanY = idMath::Tan( DEG2RAD( view->fov_y * 0.5f ) );
+
+	// viewaxis[1] points left and viewaxis[2] up, screen x goes right and y down
+	screen.x = SCREEN_WIDTH * 0.5f * ( 1.0f - ( delta * view->viewaxis[1] ) / ( forward * tanX ) );
+	screen.y = SCREEN_HEIGHT * 0.5f * ( 1.0f - ( delta * view->viewaxis[2] ) / ( forward * tanY ) );
+	return true;
+}
+
+/*
+===================
+idPlayerView::DrawActionCrosshair
+
+guis/cursor.gui places its crosshair at fixed coordinates, so the action camera draws the same
+images here, at the point the shots will hit. Same colors as the gui, and the same red flash
+for 200 msec after a hit.
+===================
+*/
+void idPlayerView::DrawActionCrosshair( const renderView_t *view, const idVec3 &aimPoint, bool aimHit, bool hitFeedback ) {
+	const float size = 32.0f;
+	idVec2 pos( SCREEN_WIDTH * 0.5f, SCREEN_HEIGHT * 0.5f );
+	idVec2 projected;
+
+	if ( view != NULL && aimHit && WorldToScreen( view, aimPoint, projected ) &&
+		projected.x >= 0.0f && projected.x <= SCREEN_WIDTH && projected.y >= 0.0f && projected.y <= SCREEN_HEIGHT ) {
+		pos = projected;
+	}
+
+	const float x = pos.x - size * 0.5f;
+	const float y = pos.y - size * 0.5f;
+
+	if ( hitFeedback ) {
+		renderSystem->SetColor4( 1.0f, 1.0f, 1.0f, 1.0f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairCenterMaterial );
+		renderSystem->SetColor4( 0.45f, 0.7f, 0.65f, 0.5f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairCenter2Material );
+		renderSystem->SetColor4( 0.8f, 0.0f, 0.0f, 1.0f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairLightMaterial );
+		renderSystem->SetColor4( 0.6f, 0.3f, 0.0f, 0.6f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairFrameMaterial );
+	} else {
+		renderSystem->SetColor4( 0.7f, 1.0f, 0.8f, 1.0f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairCenterMaterial );
+		renderSystem->SetColor4( 0.45f, 0.7f, 0.65f, 0.5f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairCenter2Material );
+		renderSystem->SetColor4( 0.45f, 0.7f, 0.65f, 0.2f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairLightMaterial );
+		renderSystem->SetColor4( 0.45f, 0.7f, 0.65f, 0.1f );
+		renderSystem->DrawStretchPic( x, y, size, size, 0.0f, 0.0f, 1.0f, 1.0f, crosshairFrameMaterial );
+	}
+	renderSystem->SetColor4( 1.0f, 1.0f, 1.0f, 1.0f );
 }
 
 /*

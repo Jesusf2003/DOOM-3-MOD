@@ -464,7 +464,7 @@ public:
 
 private:
 	const static int		INITIAL_SPAWN_COUNT = 1;
-	const static int		INTERNAL_SAVEGAME_VERSION = 5; // DG: added this for >= 1305 savegames. 2: idPlayer::hasBlinkSkill (PLAYER_SAVEGAME_SKILLS) 3: idPlayer off-hand viewmodel (PLAYER_SAVEGAME_OFFHAND) 4: idAI awareness / incapacitation states (AI_SAVEGAME_AWARENESS) 5: idAI last heard stealth sound (AI_SAVEGAME_HEARING)
+	const static int		INTERNAL_SAVEGAME_VERSION = 6; // DG: added this for >= 1305 savegames. 2: idPlayer::hasBlinkSkill (PLAYER_SAVEGAME_SKILLS) 3: idPlayer off-hand viewmodel (PLAYER_SAVEGAME_OFFHAND) 4: idAI awareness / incapacitation states (AI_SAVEGAME_AWARENESS) 5: idAI last heard stealth sound (AI_SAVEGAME_HEARING) 6: idPlayer action camera (PLAYER_SAVEGAME_ACTIONCAM)
 
 	idStr					mapFileName;			// name of the map, empty string if no map loaded
 	idMapFile *				mapFile;				// will be NULL during the game unless in-game editing is used

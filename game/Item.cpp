@@ -60,6 +60,58 @@ CLASS_DECLARATION( idEntity, idItem )
 	EVENT( EV_RespawnFx,		idItem::Event_RespawnFx )
 END_CLASS
 
+static const float	ITEM_BOUNCE_SOUND_MIN_VELOCITY	= 80.0f;
+static const float	ITEM_BOUNCE_SOUND_MAX_VELOCITY	= 200.0f;
+static const int	ITEM_BOUNCE_SOUND_DELAY			= 300;
+static const int	ITEM_MAX_UNSTICK_HEIGHT			= 16;	// map items were placed for the old drop to floor trace
+
+/*
+================
+Item_LoadTraceModel
+
+  Builds the collision model for a rigid body item from "clipmins" / "clipmaxs",
+  "clipmodel" or the visual model, in that order of preference.
+  Returns false if the item has nothing to build a collision model from.
+================
+*/
+static bool Item_LoadTraceModel( const idEntity *ent, idTraceModel &trm ) {
+	idStr clipModelName;
+	idVec3 clipMins, clipMaxs;
+
+	if ( ent->spawnArgs.GetVector( "clipmins", NULL, clipMins ) && ent->spawnArgs.GetVector( "clipmaxs", NULL, clipMaxs ) ) {
+		// an explicit box always wins, no mesh involved
+		trm.SetupBox( idBounds( clipMins, clipMaxs ) );
+	} else {
+		// check if a clip model is set
+		ent->spawnArgs.GetString( "clipmodel", "", clipModelName );
+		if ( !clipModelName[0] ) {
+			clipModelName = ent->spawnArgs.GetString( "model" );		// use the visual model
+		}
+		if ( !clipModelName[0] ) {
+			return false;
+		}
+
+		// load the trace model
+		if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
+			// too complex for a trace model (more than MAX_TRACEMODEL_VERTS vertices), which is the
+			// case for most item meshes: use its bounding box
+			idRenderModel *renderModel = renderModelManager->FindModel( clipModelName );
+			if ( renderModel == NULL || renderModel->Bounds().IsCleared() ) {
+				return false;
+			}
+			gameLocal.DPrintf( "%s '%s': %s is too complex for a collision model, using its bounding box (set clipmins / clipmaxs in the def)\n", ent->GetClassname(), ent->name.c_str(), clipModelName.c_str() );
+			trm.SetupBox( renderModel->Bounds() );
+		}
+	}
+
+	// if the model should be shrinked
+	if ( ent->spawnArgs.GetBool( "clipshrink" ) ) {
+		trm.Shrink( CM_CLIP_EPSILON );
+	}
+
+	return true;
+}
+
 
 /*
 ================
@@ -75,8 +127,14 @@ idItem::idItem() {
 	itemShellHandle = -1;
 	shellMaterial = NULL;
 	orgOrigin.Zero();
+	orgAxis.Identity();
 	canPickUp = true;
 	fl.networkSync = true;
+	trigger = NULL;
+	usePhysics = false;
+	useToPickup = false;
+	useRange = 0.0f;
+	nextBounceSoundTime = 0;
 }
 
 /*
@@ -89,6 +147,7 @@ idItem::~idItem() {
 	if ( itemShellHandle != -1 ) {
 		gameRenderWorld->FreeEntityDef( itemShellHandle );
 	}
+	delete trigger;
 }
 
 /*
@@ -97,6 +156,16 @@ idItem::Save
 ================
 */
 void idItem::Save( idSaveGame *savefile ) const {
+
+	savefile->WriteBool( usePhysics );
+	if ( usePhysics ) {
+		savefile->WriteStaticObject( physicsObj );
+	}
+	savefile->WriteClipModel( trigger );
+	savefile->WriteBool( useToPickup );
+	savefile->WriteFloat( useRange );
+	savefile->WriteInt( nextBounceSoundTime );
+	savefile->WriteMat3( orgAxis );
 
 	savefile->WriteVec3( orgOrigin );
 	savefile->WriteBool( spin );
@@ -117,6 +186,17 @@ idItem::Restore
 ================
 */
 void idItem::Restore( idRestoreGame *savefile ) {
+
+	savefile->ReadBool( usePhysics );
+	if ( usePhysics ) {
+		savefile->ReadStaticObject( physicsObj );
+		RestorePhysics( &physicsObj );
+	}
+	savefile->ReadClipModel( trigger );
+	savefile->ReadBool( useToPickup );
+	savefile->ReadFloat( useRange );
+	savefile->ReadInt( nextBounceSoundTime );
+	savefile->ReadMat3( orgAxis );
 
 	savefile->ReadVec3( orgOrigin );
 	savefile->ReadBool( spin );
@@ -219,7 +299,14 @@ idItem::Think
 ================
 */
 void idItem::Think( void ) {
-	if ( thinkFlags & TH_THINK ) {
+	if ( usePhysics ) {
+		RunPhysics();
+
+		if ( trigger && ( thinkFlags & TH_PHYSICS ) ) {
+			// keep the pickup volume on the body while it moves
+			trigger->Link( gameLocal.clip, this, 0, GetPhysics()->GetOrigin(), mat3_identity );
+		}
+	} else if ( thinkFlags & TH_THINK ) {
 		if ( spin ) {
 			idAngles	ang;
 			idVec3		org;
@@ -277,19 +364,30 @@ void idItem::Spawn( void ) {
 	idEntity *	ent;
 	float		tsize;
 
-	if ( spawnArgs.GetBool( "dropToFloor" ) ) {
-		PostEventMS( &EV_DropToFloor, 0 );
-	}
+	usePhysics = SetupPhysics();
 
-	if ( spawnArgs.GetFloat( "triggersize", "0", tsize ) ) {
-		GetPhysics()->GetClipModel()->LoadModel( idTraceModel( idBounds( vec3_origin ).Expand( tsize ) ) );
-		GetPhysics()->GetClipModel()->Link( gameLocal.clip );
+	if ( !usePhysics ) {
+		// classic static item: snap to the floor and use the item clip model itself as the trigger
+		if ( spawnArgs.GetBool( "dropToFloor" ) ) {
+			PostEventMS( &EV_DropToFloor, 0 );
+		}
+
+		if ( spawnArgs.GetFloat( "triggersize", "0", tsize ) ) {
+			GetPhysics()->GetClipModel()->LoadModel( idTraceModel( idBounds( vec3_origin ).Expand( tsize ) ) );
+			GetPhysics()->GetClipModel()->Link( gameLocal.clip );
+		}
 	}
 
 	if ( spawnArgs.GetBool( "start_off" ) ) {
 		GetPhysics()->SetContents( 0 );
+		if ( trigger ) {
+			trigger->SetContents( 0 );
+		}
+		if ( usePhysics ) {
+			physicsObj.PutToRest();
+		}
 		Hide();
-	} else {
+	} else if ( !usePhysics ) {
 		GetPhysics()->SetContents( CONTENTS_TRIGGER );
 	}
 
@@ -302,7 +400,8 @@ void idItem::Spawn( void ) {
 		PostEventMS( &EV_Touch, 0, ent, 0 );
 	}
 
-	if ( spawnArgs.GetBool( "spin" ) || gameLocal.isMultiplayer ) {
+	// floating spin only makes sense for the static items
+	if ( !usePhysics && ( spawnArgs.GetBool( "spin" ) || gameLocal.isMultiplayer ) ) {
 		spin = true;
 		BecomeActive( TH_THINK );
 	}
@@ -311,13 +410,99 @@ void idItem::Spawn( void ) {
 	//temp hack for tim
 	pulse = false;
 	orgOrigin = GetPhysics()->GetOrigin();
+	orgAxis = GetPhysics()->GetAxis();
 
 	canPickUp = !( spawnArgs.GetBool( "triggerFirst" ) || spawnArgs.GetBool( "no_touch" ) );
+
+	useToPickup = spawnArgs.GetBool( "pickup_use", "1" );
+	useRange = spawnArgs.GetFloat( "pickup_use_range", "96" );
+	nextBounceSoundTime = 0;
 
 	inViewTime = -1000;
 	lastCycle = -1;
 	itemShellHandle = -1;
 	shellMaterial = declManager->FindMaterial( "itemHighlightShell" );
+}
+
+/*
+================
+idItem::SetupPhysics
+
+  Replaces the static physics with a rigid body. Returns false, leaving the
+  item static, when it opts out ("item_physics" "0") or has no usable model.
+================
+*/
+bool idItem::SetupPhysics( void ) {
+	idTraceModel trm;
+	float density, friction, bouncyness, mass, tsize;
+	idVec3 origin, up;
+	int i;
+
+	if ( !spawnArgs.GetBool( "item_physics", "1" ) ) {
+		return false;
+	}
+
+	if ( !Item_LoadTraceModel( this, trm ) ) {
+		return false;
+	}
+
+	// get rigid body properties
+	spawnArgs.GetFloat( "density", "0.5", density );
+	density = idMath::ClampFloat( 0.001f, 1000.0f, density );
+	spawnArgs.GetFloat( "mass", "10", mass );
+	mass = idMath::ClampFloat( 0.1f, 10000.0f, mass );
+	spawnArgs.GetFloat( "friction", "0.3", friction );
+	friction = idMath::ClampFloat( 0.0f, 1.0f, friction );
+	spawnArgs.GetFloat( "bouncyness", "0.2", bouncyness );
+	bouncyness = idMath::ClampFloat( 0.0f, 1.0f, bouncyness );
+
+	// setup the physics, the density only shapes the inertia tensor, the mass is always explicit
+	// so that every item reacts the same way to impacts and explosions
+	physicsObj.SetSelf( this );
+	physicsObj.SetClipModel( new idClipModel( trm ), density );
+	physicsObj.SetMass( mass );
+	physicsObj.SetOrigin( GetPhysics()->GetOrigin() );
+	physicsObj.SetAxis( GetPhysics()->GetAxis() );
+	physicsObj.SetBouncyness( bouncyness );
+	physicsObj.SetFriction( spawnArgs.GetFloat( "linear_friction", "0.6" ), spawnArgs.GetFloat( "angular_friction", "0.6" ), friction );
+	physicsObj.SetGravity( gameLocal.GetGravity() );
+	physicsObj.SetContents( CONTENTS_RENDERMODEL );		// hit by shots and the use trace, the player walks through it
+	physicsObj.SetClipMask( MASK_SOLID | CONTENTS_MOVEABLECLIP );
+	SetPhysics( &physicsObj );
+
+	// items placed for the old floor snap often poke into the floor, lift them out
+	// instead of letting the solver push them through it
+	origin = physicsObj.GetOrigin();
+	up = -gameLocal.GetGravity();
+	up.Normalize();
+	for ( i = 0; i <= ITEM_MAX_UNSTICK_HEIGHT; i++ ) {
+		if ( !gameLocal.clip.Contents( origin + up * i, physicsObj.GetClipModel(), physicsObj.GetAxis(), physicsObj.GetClipMask(), this ) ) {
+			break;
+		}
+	}
+	if ( i > ITEM_MAX_UNSTICK_HEIGHT ) {
+		gameLocal.DWarning( "item '%s' starts in solid at (%s)", name.c_str(), origin.ToString( 0 ) );
+	} else if ( i > 0 ) {
+		physicsObj.SetOrigin( origin + up * i );
+	}
+
+	// no floor snap: the item falls with gravity from where it was placed or thrown
+	physicsObj.EnableImpact();
+	if ( spawnArgs.GetBool( "nodrop" ) || i > ITEM_MAX_UNSTICK_HEIGHT ) {
+		physicsObj.PutToRest();
+	} else {
+		physicsObj.Activate();
+	}
+
+	// touch pickup goes through Event_Touch, so it needs a trigger volume that follows the body
+	if ( spawnArgs.GetBool( "pickup_touch", "1" ) ) {
+		spawnArgs.GetFloat( "triggersize", "16.0", tsize );
+		trigger = new idClipModel( idTraceModel( idBounds( vec3_origin ).Expand( tsize ) ) );
+		trigger->Link( gameLocal.clip, this, 0, GetPhysics()->GetOrigin(), mat3_identity );
+		trigger->SetContents( CONTENTS_TRIGGER );
+	}
+
+	return true;
 }
 
 /*
@@ -377,6 +562,9 @@ bool idItem::Pickup( idPlayer *player ) {
 
 	// clear our contents so the object isn't picked up twice
 	GetPhysics()->SetContents( 0 );
+	if ( trigger ) {
+		trigger->SetContents( 0 );
+	}
 
 	// hide the model
 	Hide();
@@ -409,8 +597,53 @@ bool idItem::Pickup( idPlayer *player ) {
 		}
 	}
 
-	BecomeInactive( TH_THINK );
+	BecomeInactive( TH_THINK | TH_PHYSICS );
 	return true;
+}
+
+/*
+================
+idItem::Collide
+================
+*/
+bool idItem::Collide( const trace_t &collision, const idVec3 &velocity ) {
+	float v, f;
+
+	v = -( velocity * collision.c.normal );
+	if ( v > ITEM_BOUNCE_SOUND_MIN_VELOCITY && gameLocal.time > nextBounceSoundTime ) {
+		f = v > ITEM_BOUNCE_SOUND_MAX_VELOCITY ? 1.0f : idMath::Sqrt( v - ITEM_BOUNCE_SOUND_MIN_VELOCITY ) * ( 1.0f / idMath::Sqrt( ITEM_BOUNCE_SOUND_MAX_VELOCITY - ITEM_BOUNCE_SOUND_MIN_VELOCITY ) );
+		if ( StartSound( "snd_bounce", SND_CHANNEL_BODY, 0, false, NULL ) ) {
+			// only set the volume when there is a bounce sound, it overrides the whole channel
+			SetSoundVolume( f );
+		}
+		nextBounceSoundTime = gameLocal.time + ITEM_BOUNCE_SOUND_DELAY;
+	}
+
+	return false;
+}
+
+/*
+================
+idItem::CanBeUsedBy
+================
+*/
+bool idItem::CanBeUsedBy( const idPlayer *player, float distance ) const {
+	if ( !useToPickup || IsHidden() || player == NULL || player->health <= 0 ) {
+		return false;
+	}
+	return distance <= useRange;
+}
+
+/*
+================
+idItem::Use
+================
+*/
+bool idItem::Use( idPlayer *player ) {
+	if ( !useToPickup || IsHidden() ) {
+		return false;
+	}
+	return Pickup( player );
 }
 
 /*
@@ -433,6 +666,9 @@ idItem::WriteFromSnapshot
 */
 void idItem::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	msg.WriteBits( IsHidden(), 1 );
+	if ( usePhysics ) {
+		physicsObj.WriteToSnapshot( msg );
+	}
 }
 
 /*
@@ -445,6 +681,12 @@ void idItem::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 		Hide();
 	} else {
 		Show();
+	}
+	if ( usePhysics ) {
+		physicsObj.ReadFromSnapshot( msg );
+		if ( msg.HasChanged() ) {
+			UpdateVisuals();
+		}
 	}
 }
 
@@ -493,6 +735,11 @@ idItem::Event_DropToFloor
 */
 void idItem::Event_DropToFloor( void ) {
 	trace_t trace;
+
+	// rigid body items fall with gravity
+	if ( usePhysics ) {
+		return;
+	}
 
 	// don't drop the floor if bound to another entity
 	if ( GetBindMaster() != NULL && GetBindMaster() != this ) {
@@ -550,8 +797,19 @@ void idItem::Event_Respawn( void ) {
 	Show();
 	inViewTime = -1000;
 	lastCycle = -1;
-	GetPhysics()->SetContents( CONTENTS_TRIGGER );
-	SetOrigin( orgOrigin );
+	if ( usePhysics ) {
+		physicsObj.SetContents( CONTENTS_RENDERMODEL );
+		if ( trigger ) {
+			trigger->SetContents( CONTENTS_TRIGGER );
+		}
+		SetOrigin( orgOrigin );
+		SetAxis( orgAxis );
+		physicsObj.SetLinearVelocity( vec3_origin );		// also wakes the body up
+		physicsObj.SetAngularVelocity( vec3_origin );
+	} else {
+		GetPhysics()->SetContents( CONTENTS_TRIGGER );
+		SetOrigin( orgOrigin );
+	}
 	StartSound( "snd_respawn", SND_CHANNEL_ITEM, 0, false, NULL );
 	CancelEvents( &EV_RespawnItem ); // don't double respawn
 }
@@ -858,7 +1116,6 @@ bool idPDAItem::GiveToPlayer(idPlayer *player) {
 */
 
 CLASS_DECLARATION( idItem, idMoveableItem )
-	EVENT( EV_DropToFloor,	idMoveableItem::Event_DropToFloor )
 	EVENT( EV_Gib,			idMoveableItem::Event_Gib )
 END_CLASS
 
@@ -868,7 +1125,6 @@ idMoveableItem::idMoveableItem
 ================
 */
 idMoveableItem::idMoveableItem() {
-	trigger = NULL;
 	smoke = NULL;
 	smokeTime = 0;
 }
@@ -879,9 +1135,6 @@ idMoveableItem::~idMoveableItem
 ================
 */
 idMoveableItem::~idMoveableItem() {
-	if ( trigger ) {
-		delete trigger;
-	}
 }
 
 /*
@@ -890,10 +1143,6 @@ idMoveableItem::Save
 ================
 */
 void idMoveableItem::Save( idSaveGame *savefile ) const {
-	savefile->WriteStaticObject( physicsObj );
-
-	savefile->WriteClipModel( trigger );
-
 	savefile->WriteParticle( smoke );
 	savefile->WriteInt( smokeTime );
 }
@@ -904,11 +1153,6 @@ idMoveableItem::Restore
 ================
 */
 void idMoveableItem::Restore( idRestoreGame *savefile ) {
-	savefile->ReadStaticObject( physicsObj );
-	RestorePhysics( &physicsObj );
-
-	savefile->ReadClipModel( trigger );
-
 	savefile->ReadParticle( smoke );
 	savefile->ReadInt( smokeTime );
 }
@@ -916,69 +1160,15 @@ void idMoveableItem::Restore( idRestoreGame *savefile ) {
 /*
 ================
 idMoveableItem::Spawn
+
+  The rigid body and the pickup trigger are set up by idItem::Spawn.
 ================
 */
 void idMoveableItem::Spawn( void ) {
-	idTraceModel trm;
-	float density, friction, bouncyness, tsize;
-	idStr clipModelName;
-	idBounds bounds;
-	idVec3 clipMins, clipMaxs;
-
-	// create a trigger for item pickup
-	spawnArgs.GetFloat( "triggersize", "16.0", tsize );
-	trigger = new idClipModel( idTraceModel( idBounds( vec3_origin ).Expand( tsize ) ) );
-	trigger->Link( gameLocal.clip, this, 0, GetPhysics()->GetOrigin(), GetPhysics()->GetAxis() );
-	trigger->SetContents( CONTENTS_TRIGGER );
-
-	if ( spawnArgs.GetVector( "clipmins", NULL, clipMins ) && spawnArgs.GetVector( "clipmaxs", NULL, clipMaxs ) ) {
-		// an explicit box always wins, no mesh involved
-		trm.SetupBox( idBounds( clipMins, clipMaxs ) );
-	} else {
-		// check if a clip model is set
-		spawnArgs.GetString( "clipmodel", "", clipModelName );
-		if ( !clipModelName[0] ) {
-			clipModelName = spawnArgs.GetString( "model" );		// use the visual model
-		}
-
-		// load the trace model
-		if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
-			// too complex for a trace model (more than MAX_TRACEMODEL_VERTS vertices): fall back to its
-			// bounding box instead of taking the whole map down
-			idRenderModel *renderModel = renderModelManager->FindModel( clipModelName );
-			if ( renderModel == NULL || renderModel->Bounds().IsCleared() ) {
-				gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
-				return;
-			}
-			gameLocal.Warning( "idMoveableItem '%s': %s is too complex for a collision model, using its bounding box (set clipmins / clipmaxs in the def)", name.c_str(), clipModelName.c_str() );
-			trm.SetupBox( renderModel->Bounds() );
-		}
+	if ( !usePhysics ) {
+		gameLocal.Error( "idMoveableItem '%s': cannot load collision model %s", name.c_str(), spawnArgs.GetString( "model" ) );
+		return;
 	}
-
-	// if the model should be shrinked
-	if ( spawnArgs.GetBool( "clipshrink" ) ) {
-		trm.Shrink( CM_CLIP_EPSILON );
-	}
-
-	// get rigid body properties
-	spawnArgs.GetFloat( "density", "0.5", density );
-	density = idMath::ClampFloat( 0.001f, 1000.0f, density );
-	spawnArgs.GetFloat( "friction", "0.05", friction );
-	friction = idMath::ClampFloat( 0.0f, 1.0f, friction );
-	spawnArgs.GetFloat( "bouncyness", "0.6", bouncyness );
-	bouncyness = idMath::ClampFloat( 0.0f, 1.0f, bouncyness );
-
-	// setup the physics
-	physicsObj.SetSelf( this );
-	physicsObj.SetClipModel( new idClipModel( trm ), density );
-	physicsObj.SetOrigin( GetPhysics()->GetOrigin() );
-	physicsObj.SetAxis( GetPhysics()->GetAxis() );
-	physicsObj.SetBouncyness( bouncyness );
-	physicsObj.SetFriction( 0.6f, 0.6f, friction );
-	physicsObj.SetGravity( gameLocal.GetGravity() );
-	physicsObj.SetContents( CONTENTS_RENDERMODEL );
-	physicsObj.SetClipMask( MASK_SOLID | CONTENTS_MOVEABLECLIP );
-	SetPhysics( &physicsObj );
 
 	smoke = NULL;
 	smokeTime = 0;
@@ -997,13 +1187,6 @@ idMoveableItem::Think
 */
 void idMoveableItem::Think( void ) {
 
-	RunPhysics();
-
-	if ( thinkFlags & TH_PHYSICS ) {
-		// update trigger position
-		trigger->Link( gameLocal.clip, this, 0, GetPhysics()->GetOrigin(), mat3_identity );
-	}
-
 	if ( thinkFlags & TH_UPDATEPARTICLES ) {
 		if ( !gameLocal.smokeParticles->EmitSmoke( smoke, smokeTime, gameLocal.random.CRandomFloat(), GetPhysics()->GetOrigin(), GetPhysics()->GetAxis() ) ) {
 			smokeTime = 0;
@@ -1011,20 +1194,7 @@ void idMoveableItem::Think( void ) {
 		}
 	}
 
-	Present();
-}
-
-/*
-================
-idMoveableItem::Pickup
-================
-*/
-bool idMoveableItem::Pickup( idPlayer *player ) {
-	bool ret = idItem::Pickup( player );
-	if ( ret ) {
-		trigger->SetContents( 0 );
-	}
-	return ret;
+	idItem::Think();
 }
 
 /*
@@ -1142,27 +1312,6 @@ void idMoveableItem::DropItems( idAnimatedEntity  *ent, const char *type, idList
 }
 
 /*
-======================
-idMoveableItem::WriteToSnapshot
-======================
-*/
-void idMoveableItem::WriteToSnapshot( idBitMsgDelta &msg ) const {
-	physicsObj.WriteToSnapshot( msg );
-}
-
-/*
-======================
-idMoveableItem::ReadFromSnapshot
-======================
-*/
-void idMoveableItem::ReadFromSnapshot( const idBitMsgDelta &msg ) {
-	physicsObj.ReadFromSnapshot( msg );
-	if ( msg.HasChanged() ) {
-		UpdateVisuals();
-	}
-}
-
-/*
 ============
 idMoveableItem::Gib
 ============
@@ -1176,15 +1325,6 @@ void idMoveableItem::Gib( const idVec3 &dir, const char *damageDefName ) {
 	}
 	// remove the entity
 	PostEventMS( &EV_Remove, 0 );
-}
-
-/*
-================
-idMoveableItem::Event_DropToFloor
-================
-*/
-void idMoveableItem::Event_DropToFloor( void ) {
-	// the physics will drop the moveable to the floor
 }
 
 /*

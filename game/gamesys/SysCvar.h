@@ -201,6 +201,7 @@ extern idCVar	pm_thirdPersonAngle;
 extern idCVar	pm_thirdPersonClip;
 extern idCVar	pm_thirdPerson;
 extern idCVar	pm_thirdPersonDeath;
+extern idCVar	pm_actionCamera;
 extern idCVar	pm_modelView;
 extern idCVar	pm_airTics;
 

@@ -409,6 +409,7 @@ set(src_game
 	game/Player.cpp
 	game/PlayerIcon.cpp
 	game/PlayerView.cpp
+	game/PlayerCamera.cpp
 	game/Projectile.cpp
 	game/Pvs.cpp
 	game/SecurityCamera.cpp

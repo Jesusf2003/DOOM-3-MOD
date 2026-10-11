@@ -38,6 +38,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Projectile.h"
 #include "PlayerIcon.h"
 #include "GameEdit.h"
+#include "PlayerCamera.h"
 
 class idAI;
 
@@ -91,11 +92,24 @@ const float LEAN_MAX_OFFSET = 28.0f;	// lateral camera offset at full lean, in w
 const float LEAN_MAX_ROLL = 8.0f;		// head roll at full lean, in degrees
 const float LEAN_SPEED = 5.0f;			// leanAmount change per second (0.2s to fully lean)
 
+// action camera (pm_actionCamera)
+const float BODY_TURN_MIN_SPEED = 10.0f;		// slides / vaults only turn the body while moving faster than this
+const float ACTION_AIM_DISTANCE = 8192.0f;		// how far the center of the screen is traced for the aim
+const float ACTION_AIM_START_AHEAD = 16.0f;		// the aim trace starts this far past the eyes, clear of the own head
+const float ACTION_AIM_MIN_DIST = 8.0f;			// aim points closer than this in front of the eyes aim along the camera
+const int ACTION_AIM_HOLD_MSEC = 600;			// combat stance (body faces the aim) lasts this long after the last shot
+const float ACTION_CROSSHAIR_MAX_DIST = 4096.0f;	// hits further than this put the crosshair back in the center
+const int ACTION_CROSSHAIR_HIT_MSEC = 200;		// red crosshair after a hit, like guis/cursor.gui
+const float ACTION_TORSO_PITCH_LIMIT = 45.0f;	// torso aim pitch blend limit, keeps the skeleton from breaking
+const float ACTION_TORSO_PITCH_SPEED = 360.0f;	// degrees per second the torso pitch follows the aim
+
 // skills unlocked with "give_skill <name>", kept across levels and in savegames. Savegames from before
 // this internal savegame version (idGameLocal::INTERNAL_SAVEGAME_VERSION) don't have them and still load
 const int PLAYER_SAVEGAME_SKILLS = 2;
 // off-hand viewmodel state (offHandDefName, offHandActive, offHandWorldModel), older savegames start without it
 const int PLAYER_SAVEGAME_OFFHAND = 3;
+// action camera state (cameraAngles, bodyYaw, aimAngles, camera and lock-on), older savegames start in the default state
+const int PLAYER_SAVEGAME_ACTIONCAM = 6;
 
 // off-hand viewmodel (left hand: magic / flashlight), placed relative to the first person view
 const float OFFHAND_VIEW_OFFSET_LEFT = 8.0f;		// along the view's left axis (axis[1]: x forward, y left, z up)
@@ -303,6 +317,21 @@ public:
 	idAngles				viewAngles;			// player view angles
 	idAngles				cmdAngles;			// player cmd angles
 
+							// action camera (pm_actionCamera): the mouse moves cameraAngles, viewAngles only keeps the
+							// movement heading (camera yaw, or towards the lock-on target) and the body turns on its own
+	idAngles				cameraAngles;		// orbit camera angles, driven by the usercmd through deltaViewAngles
+	float					bodyYaw;			// eased model yaw, towards the movement or the lock-on target
+	idAngles				aimAngles;			// from the eyes to what is in the center of the screen (weapons, blink, use)
+	idVec3					actionAimDir;		// aimAngles as a world direction
+	idVec3					actionAimPoint;		// where a shot along the aim lands, traced from the eyes (crosshair)
+	bool					actionAimHit;		// actionAimPoint is a real hit within ACTION_CROSSHAIR_MAX_DIST
+	int						actionAimHoldTime;	// combat stance until this time (not saved)
+	float					actionTorsoPitch;	// eased torso pitch blend of the action camera (not saved)
+	bool					actionCameraActive;	// action camera on this frame
+	float					bodyTurnRate;		// degrees per second ("body_turn_rate")
+	idThirdPersonCamera		thirdPersonCam;
+	idLockOnSystem			lockOn;
+
 	int						buttonMask;
 	int						oldButtons;
 	int						oldFlags;
@@ -483,6 +512,17 @@ public:
 	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis );
 	idVec3					GetEyePosition( void ) const;
 	void					GetViewPos( idVec3 &origin, idMat3 &axis ) const;
+
+							// action camera
+	bool					WantsActionCamera( void ) const;
+	bool					UsesActionCamera( void ) const { return actionCameraActive; }
+	const idAngles &		GetCameraAngles( void ) const { return cameraAngles; }
+	void					SetCameraAngles( const idAngles &angles );
+	idLockOnSystem &		GetLockOn( void ) { return lockOn; }
+	const idMat3 &			GetGravityAxis( void ) const { return physicsObj.GetGravityAxis(); }	// also while the ragdoll owns GetPhysics()
+	void					ToggleLockOn( void );
+							// firing, aiming the blink or locked on (and a moment after): the body faces the aim
+	bool					IsActionAiming( void ) const;
 	idVec3					GetLeanRightVector( void ) const;
 
 	bool					IsSprinting( void ) const;
@@ -811,6 +851,9 @@ private:
 	virtual void			PlayFootStepSound( void );	// also the stealth noise of the step
 	void					BobCycle( const idVec3 &pushVelocity );
 	void					UpdateViewAngles( void );
+	void					UpdateActionCameraMode( void );
+	void					UpdateBodyYaw( void );
+	void					UpdateActionAim( const idVec3 &viewOrigin, const idMat3 &viewAxis );
 	void					EvaluateControls( void );
 	void					AdjustSpeed( void );
 	bool					WantsToSprint( void ) const;
@@ -833,6 +876,7 @@ private:
 	void					UpdateObjectiveInfo( void );
 
 	void					UseVehicle( void );
+	bool					UseItem( void );
 
 	void					Event_GetButtons( void );
 	void					Event_GetMove( void );

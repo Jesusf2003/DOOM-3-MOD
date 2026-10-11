@@ -77,6 +77,12 @@ public:
 						// procedural first person camera (lean offset + head roll)
 	void				CalculatePlayerView( idVec3 &origin, idAngles &angles ) const;
 	void				ClampCameraToWorld( idVec3 &origin ) const;
+
+						// action camera crosshair, drawn at the screen projection of where the shots land.
+						// Centered when aimHit is false (nothing hit, or too far away to matter)
+	void				DrawActionCrosshair( const renderView_t *view, const idVec3 &aimPoint, bool aimHit, bool hitFeedback );
+						// world point to the 640x480 virtual screen of the HUD, false when it is behind the view
+	static bool			WorldToScreen( const renderView_t *view, const idVec3 &point, idVec2 &screen );
 	float				CameraClipRadius( void ) const;
 						// sprint fov, updated once per game frame
 	void				UpdateSprintFov( int msec );
@@ -125,6 +131,10 @@ private:
 	const idMaterial *	bloodSprayMaterial; // blood spray
 	const idMaterial *	bfgMaterial;		// when targeted with BFG
 	const idMaterial *	lagoMaterial;		// lagometer drawing
+	const idMaterial *	crosshairCenterMaterial;	// action camera crosshair, the images of guis/cursor.gui (not saved)
+	const idMaterial *	crosshairCenter2Material;
+	const idMaterial *	crosshairLightMaterial;
+	const idMaterial *	crosshairFrameMaterial;
 	float				lastDamageTime;		// accentuate the tunnel effect for a while
 
 	idVec4				fadeColor;			// fade color

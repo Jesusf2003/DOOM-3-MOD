@@ -56,6 +56,11 @@ public:
 	virtual bool			Pickup( idPlayer *player );
 	virtual void			Think( void );
 	virtual void			Present();
+	virtual bool			Collide( const trace_t &collision, const idVec3 &velocity );
+
+	// use key / raycast interaction
+	bool					CanBeUsedBy( const idPlayer *player, float distance ) const;
+	bool					Use( idPlayer *player );
 
 	enum {
 		EVENT_PICKUP = idEntity::EVENT_MAXEVENTS,
@@ -71,8 +76,15 @@ public:
 	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const;
 	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg );
 
+protected:
+	// rigid body physics, used unless the item has no model or sets "item_physics" "0"
+	idPhysics_RigidBody		physicsObj;
+	idClipModel *			trigger;			// touch pickup volume that follows the body
+	bool					usePhysics;
+
 private:
 	idVec3					orgOrigin;
+	idMat3					orgAxis;
 	bool					spin;
 	bool					pulse;
 	bool					canPickUp;
@@ -87,6 +99,11 @@ private:
 	mutable int				lastCycle;
 	mutable int				lastRenderViewTime;
 
+	bool					useToPickup;
+	float					useRange;
+	int						nextBounceSoundTime;
+
+	bool					SetupPhysics( void );
 	bool					UpdateRenderEntity( renderEntity_s *renderEntity, const renderView_t *renderView ) const;
 	static bool				ModelCallback( renderEntity_s *renderEntity, const renderView_t *renderView );
 
@@ -161,23 +178,16 @@ public:
 
 	void					Spawn( void );
 	virtual void			Think( void );
-	virtual bool			Pickup( idPlayer *player );
 
 	static void				DropItems( idAnimatedEntity *ent, const char *type, idList<idEntity *> *list );
 	static idEntity	*		DropItem( const char *classname, const idVec3 &origin, const idMat3 &axis, const idVec3 &velocity, int activateDelay, int removeDelay );
 
-	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const;
-	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg );
-
 private:
-	idPhysics_RigidBody		physicsObj;
-	idClipModel *			trigger;
 	const idDeclParticle *	smoke;
 	int						smokeTime;
 
 	void					Gib( const idVec3 &dir, const char *damageDefName );
 
-	void					Event_DropToFloor( void );
 	void					Event_Gib( const char *damageDefName );
 };
 

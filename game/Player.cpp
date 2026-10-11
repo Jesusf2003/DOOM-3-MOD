@@ -999,6 +999,18 @@ idPlayer::idPlayer() {
 	blinkCancelled			= false;
 	weapon_flashlight		= -1;
 	hasBlinkSkill			= false;
+	cameraAngles.Zero();
+	bodyYaw					= 0.0f;
+	aimAngles.Zero();
+	actionAimDir.Zero();
+	actionAimPoint.Zero();
+	actionAimHit			= false;
+	actionAimHoldTime		= 0;
+	actionTorsoPitch		= 0.0f;
+	actionCameraActive		= false;
+	bodyTurnRate			= 720.0f;
+	thirdPersonCam.Reset();
+	lockOn.Release();
 	vaultViewPitch			= 0.0f;
 	vaultViewRoll			= 0.0f;
 	vaultYawStarted			= false;
@@ -1528,6 +1540,11 @@ void idPlayer::Spawn( void ) {
 	SetPhysics( &physicsObj );
 	InitAASLocation();
 
+	// action camera settings ("cam_*", "lockon_*", "body_turn_rate" in the player def)
+	thirdPersonCam.Configure( spawnArgs );
+	lockOn.Configure( spawnArgs );
+	bodyTurnRate = spawnArgs.GetFloat( "body_turn_rate", "720" );
+
 	skin = renderEntity.customSkin;
 
 	// only the local player needs guis
@@ -1905,6 +1922,14 @@ void idPlayer::Save( idSaveGame *savefile ) const {
 	savefile->WriteString( offHandDefName );
 	savefile->WriteBool( offHandActive );
 
+	// PLAYER_SAVEGAME_ACTIONCAM
+	savefile->WriteAngles( cameraAngles );
+	savefile->WriteFloat( bodyYaw );
+	savefile->WriteAngles( aimAngles );
+	savefile->WriteBool( actionCameraActive );
+	thirdPersonCam.Save( savefile );
+	lockOn.Save( savefile );
+
 	if ( hud ) {
 		hud->SetStateString( "message", common->GetLanguageDict()->GetString( "#str_02916" ) );
 		hud->HandleNamedEvent( "Message" );
@@ -2171,6 +2196,33 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 		offHandWorldModel = NULL;
 		offHandDefName = "";
 		offHandActive = false;
+	}
+
+	// action camera, savegames from before it existed start from the restored view angles (set by SetViewAngles above).
+	// The aim point, the combat stance and the torso pitch are rebuilt on the next frames
+	actionAimDir.Zero();
+	actionAimPoint.Zero();
+	actionAimHit = false;
+	actionAimHoldTime = 0;
+	actionTorsoPitch = 0.0f;
+	thirdPersonCam.Configure( spawnArgs );
+	lockOn.Configure( spawnArgs );
+	bodyTurnRate = spawnArgs.GetFloat( "body_turn_rate", "720" );
+	if ( savefile->GetInternalSavegameVersion() >= PLAYER_SAVEGAME_ACTIONCAM ) {
+		savefile->ReadAngles( cameraAngles );
+		savefile->ReadFloat( bodyYaw );
+		savefile->ReadAngles( aimAngles );
+		savefile->ReadBool( actionCameraActive );
+		thirdPersonCam.Restore( savefile );
+		lockOn.Restore( savefile );
+		if ( actionCameraActive ) {
+			// the mouse drives the camera angles, not the view angles
+			UpdateDeltaViewAngles( cameraAngles );
+		}
+	} else {
+		actionCameraActive = false;
+		thirdPersonCam.Reset();
+		lockOn.Release();
 	}
 
 	// create combat collision hull for exact collision detection
@@ -2786,7 +2838,12 @@ void idPlayer::DrawHUD( idUserInterface *_hud ) {
 	// weapon targeting crosshair
 	if ( !GuiActive() ) {
 		if ( cursor && weapon.GetEntity()->ShowCrosshair() ) {
-			cursor->Redraw( gameLocal.realClientTime );
+			if ( actionCameraActive ) {
+				// the gui crosshair is fixed to the center of the screen, draw it where the shots land instead
+				playerView.DrawActionCrosshair( renderView, actionAimPoint, actionAimHit, lastHitTime != 0 && gameLocal.time - lastHitTime < ACTION_CROSSHAIR_HIT_MSEC );
+			} else {
+				cursor->Redraw( gameLocal.realClientTime );
+			}
 		}
 	}
 }
@@ -5068,6 +5125,12 @@ idPlayer::SetViewAngles
 void idPlayer::SetViewAngles( const idAngles &angles ) {
 	UpdateDeltaViewAngles( angles );
 	viewAngles = angles;
+
+	// spawn, teleport, savegame...: with the action camera the angles say where the camera and the body face
+	cameraAngles = angles;
+	cameraAngles.roll = 0.0f;
+	bodyYaw = angles.yaw;
+	aimAngles = angles;
 }
 
 /*
@@ -5079,15 +5142,17 @@ void idPlayer::UpdateViewAngles( void ) {
 	int i;
 	idAngles delta;
 
+	UpdateActionCameraMode();
+
 	if ( !noclip && ( gameLocal.inCinematic || privateCameraView || gameLocal.GetCamera() || influenceActive == INFLUENCE_LEVEL2 || objectiveSystemOpen ) ) {
 		// no view changes at all, but we still want to update the deltas or else when
 		// we get out of this mode, our view will snap to a kind of random angle
-		UpdateDeltaViewAngles( viewAngles );
+		UpdateDeltaViewAngles( actionCameraActive ? cameraAngles : viewAngles );
 		return;
 	}
 
-	// if dead
-	if ( health <= 0 ) {
+	// if dead (the action camera keeps orbiting around the body)
+	if ( health <= 0 && !actionCameraActive ) {
 		if ( pm_thirdPersonDeath.GetBool() ) {
 			viewAngles.roll = 0.0f;
 			viewAngles.pitch = 30.0f;
@@ -5098,45 +5163,255 @@ void idPlayer::UpdateViewAngles( void ) {
 		return;
 	}
 
+	// the mouse moves the orbit camera with the action camera, the view itself otherwise
+	idAngles &angles = actionCameraActive ? cameraAngles : viewAngles;
+
 	// circularly clamp the angles with deltas
 	for ( i = 0; i < 3; i++ ) {
 		cmdAngles[i] = SHORT2ANGLE( usercmd.angles[i] );
 		if ( influenceActive == INFLUENCE_LEVEL3 ) {
-			viewAngles[i] += idMath::ClampFloat( -1.0f, 1.0f, idMath::AngleDelta( idMath::AngleNormalize180( SHORT2ANGLE( usercmd.angles[i]) + deltaViewAngles[i] ) , viewAngles[i] ) );
+			angles[i] += idMath::ClampFloat( -1.0f, 1.0f, idMath::AngleDelta( idMath::AngleNormalize180( SHORT2ANGLE( usercmd.angles[i]) + deltaViewAngles[i] ) , angles[i] ) );
 		} else {
-			viewAngles[i] = idMath::AngleNormalize180( SHORT2ANGLE( usercmd.angles[i]) + deltaViewAngles[i] );
+			angles[i] = idMath::AngleNormalize180( SHORT2ANGLE( usercmd.angles[i]) + deltaViewAngles[i] );
 		}
 	}
 	if ( !centerView.IsDone( gameLocal.time ) ) {
-		viewAngles.pitch = centerView.GetCurrentValue(gameLocal.time);
+		angles.pitch = centerView.GetCurrentValue(gameLocal.time);
 	}
 
 	// clamp the pitch
 	if ( noclip ) {
-		if ( viewAngles.pitch > 89.0f ) {
+		if ( angles.pitch > 89.0f ) {
 			// don't let the player look down more than 89 degrees while noclipping
-			viewAngles.pitch = 89.0f;
-		} else if ( viewAngles.pitch < -89.0f ) {
+			angles.pitch = 89.0f;
+		} else if ( angles.pitch < -89.0f ) {
 			// don't let the player look up more than 89 degrees while noclipping
-			viewAngles.pitch = -89.0f;
+			angles.pitch = -89.0f;
 		}
+	} else if ( actionCameraActive ) {
+		angles.pitch = idMath::ClampFloat( thirdPersonCam.GetMinPitch(), thirdPersonCam.GetMaxPitch(), angles.pitch );
 	} else {
-		if ( viewAngles.pitch > pm_maxviewpitch.GetFloat() ) {
+		if ( angles.pitch > pm_maxviewpitch.GetFloat() ) {
 			// don't let the player look down enough to see the shadow of his (non-existant) feet
-			viewAngles.pitch = pm_maxviewpitch.GetFloat();
-		} else if ( viewAngles.pitch < pm_minviewpitch.GetFloat() ) {
+			angles.pitch = pm_maxviewpitch.GetFloat();
+		} else if ( angles.pitch < pm_minviewpitch.GetFloat() ) {
 			// don't let the player look up more than 89 degrees
-			viewAngles.pitch = pm_minviewpitch.GetFloat();
+			angles.pitch = pm_minviewpitch.GetFloat();
 		}
 	}
 
-	UpdateDeltaViewAngles( viewAngles );
+	UpdateDeltaViewAngles( angles );
 
-	// orient the model towards the direction we're looking
-	SetAngles( idAngles( 0, viewAngles.yaw, 0 ) );
+	if ( actionCameraActive ) {
+		lockOn.Update( this );
+		if ( health > 0 ) {
+			// movement heading for the physics: the camera yaw, or straight at the lock-on target so
+			// strafing circles around it. The model is turned later, in UpdateBodyYaw
+			float heading = cameraAngles.yaw;
+			idActor *target = lockOn.GetTarget();
+			if ( target != NULL ) {
+				idVec3 toTarget = ( idLockOnSystem::GetTargetPoint( target ) - physicsObj.GetOrigin() ) * physicsObj.GetGravityAxis().Transpose();
+				toTarget.z = 0.0f;
+				if ( toTarget.LengthSqr() > 1.0f ) {
+					heading = toTarget.ToYaw();
+				}
+			}
+			viewAngles.Set( 0.0f, heading, 0.0f );
+		} else {
+			lockOn.Release();
+		}
+	} else {
+		// orient the model towards the direction we're looking
+		SetAngles( idAngles( 0, viewAngles.yaw, 0 ) );
+	}
 
 	// save in the log for analyzing weapon angle offsets
 	loggedViewAngles[ gameLocal.framenum & (NUM_LOGGED_VIEW_ANGLES-1) ] = viewAngles;
+}
+
+/*
+================
+idPlayer::WantsActionCamera
+
+Single player only. Noclip and spectating fly along the view, they keep the first person view.
+================
+*/
+bool idPlayer::WantsActionCamera( void ) const {
+	return pm_actionCamera.GetBool() && !gameLocal.isMultiplayer && !noclip && !spectating;
+}
+
+/*
+================
+idPlayer::UpdateActionCameraMode
+
+Switches between the first person view and the action camera, carrying the angles over
+so neither the view nor the body jumps.
+================
+*/
+void idPlayer::UpdateActionCameraMode( void ) {
+	const bool wanted = WantsActionCamera();
+	if ( wanted == actionCameraActive ) {
+		return;
+	}
+
+	actionCameraActive = wanted;
+	if ( actionCameraActive ) {
+		cameraAngles = viewAngles;
+		cameraAngles.roll = 0.0f;
+		bodyYaw = viewAngles.yaw;
+		aimAngles = viewAngles;
+		thirdPersonCam.Reset();
+		UpdateDeltaViewAngles( cameraAngles );
+	} else {
+		viewAngles = cameraAngles;
+		lockOn.Release();
+		UpdateDeltaViewAngles( viewAngles );
+	}
+}
+
+/*
+================
+idPlayer::SetCameraAngles
+
+Through the delta angles, so the next usercmd continues from these angles.
+================
+*/
+void idPlayer::SetCameraAngles( const idAngles &angles ) {
+	cameraAngles = angles;
+	UpdateDeltaViewAngles( cameraAngles );
+}
+
+/*
+================
+idPlayer::ToggleLockOn
+================
+*/
+void idPlayer::ToggleLockOn( void ) {
+	if ( !actionCameraActive || health <= 0 ) {
+		return;
+	}
+	if ( lockOn.IsLocked() ) {
+		lockOn.Release();
+		return;
+	}
+
+	// candidates are measured from the center of the screen, the camera of the last frame
+	if ( renderView != NULL ) {
+		lockOn.Acquire( this, renderView->vieworg, renderView->viewaxis );
+	} else {
+		idVec3 origin;
+		idMat3 axis;
+		GetViewPos( origin, axis );
+		lockOn.Acquire( this, origin, axis );
+	}
+}
+
+/*
+================
+idPlayer::UpdateBodyYaw
+
+Action camera: eases the model yaw at no more than bodyTurnRate degrees per second towards
+- the motion, during slides and vaults (they carry their own direction)
+- the aim (aimAngles), when standing still or in combat stance: firing, aiming the blink or
+  locked on, and ACTION_AIM_HOLD_MSEC after that, so the body doesn't flip back and forth between shots
+- the movement input in camera space otherwise
+Call after Move.
+================
+*/
+void idPlayer::UpdateBodyYaw( void ) {
+	if ( !actionCameraActive || health <= 0 || af.IsActive() ) {
+		return;
+	}
+
+	if ( ( usercmd.buttons & BUTTON_ATTACK ) || aimingBlink || lockOn.IsLocked() ) {
+		actionAimHoldTime = gameLocal.time + ACTION_AIM_HOLD_MSEC;
+	}
+
+	const idMat3 gravityAxisT = physicsObj.GetGravityAxis().Transpose();
+	const bool moving = ( usercmd.forwardmove != 0 || usercmd.rightmove != 0 );
+	float wantedYaw = bodyYaw;
+	bool turn = false;
+
+	if ( physicsObj.IsSliding() || physicsObj.IsVaulting() ) {
+		// slides and vaults carry their own direction, follow the motion rather than the stick
+		idVec3 velocity = physicsObj.GetLinearVelocity() * gravityAxisT;
+		velocity.z = 0.0f;
+		if ( velocity.LengthSqr() > Square( BODY_TURN_MIN_SPEED ) ) {
+			wantedYaw = velocity.ToYaw();
+			turn = true;
+		}
+	} else if ( IsActionAiming() || !moving ) {
+		// aim-oriented: the pose matches the crosshair (with a lock-on target, aimAngles points at it)
+		wantedYaw = aimAngles.yaw;
+		turn = true;
+	} else {
+		// movement-oriented: same wish direction idPhysics_Player builds from viewForward / viewRight
+		idVec3 forward, right;
+		idAngles( 0.0f, viewAngles.yaw, 0.0f ).ToVectors( &forward, &right );
+		const idVec3 wish = forward * usercmd.forwardmove + right * usercmd.rightmove;
+		wantedYaw = wish.ToYaw();
+		turn = true;
+	}
+
+	if ( turn ) {
+		const float maxStep = bodyTurnRate * MS2SEC( gameLocal.msec );
+		bodyYaw = idMath::AngleNormalize180( bodyYaw + idMath::ClampFloat( -maxStep, maxStep, idMath::AngleDelta( wantedYaw, bodyYaw ) ) );
+	}
+
+	SetAngles( idAngles( 0.0f, bodyYaw, 0.0f ) );
+}
+
+/*
+================
+idPlayer::IsActionAiming
+================
+*/
+bool idPlayer::IsActionAiming( void ) const {
+	return actionCameraActive && gameLocal.time < actionAimHoldTime;
+}
+
+/*
+================
+idPlayer::UpdateActionAim
+
+Action camera: the camera sits behind the player, so aiming along the eyes would miss what is in the
+center of the screen. Traces from the camera to find that point and aims the eyes at it (aimAngles,
+used by GetViewPos for the first person view: weapons, blink, use). With a lock-on target, aims at it.
+================
+*/
+void idPlayer::UpdateActionAim( const idVec3 &viewOrigin, const idMat3 &viewAxis ) {
+	const idVec3 eye = GetEyePosition();
+	idActor *target = lockOn.GetTarget();
+	idVec3 aimPoint;
+
+	if ( target != NULL ) {
+		aimPoint = idLockOnSystem::GetTargetPoint( target );
+	} else {
+		// start level with the eyes and a bit ahead: nothing between the camera and the player can be aimed at
+		const float startDist = Max( 0.0f, ( eye - viewOrigin ) * viewAxis[0] ) + ACTION_AIM_START_AHEAD;
+		trace_t tr;
+		gameLocal.clip.TracePoint( tr, viewOrigin + viewAxis[0] * startDist, viewOrigin + viewAxis[0] * ACTION_AIM_DISTANCE, MASK_SHOT_RENDERMODEL, this );
+		aimPoint = tr.endpos;
+	}
+
+	// a point at the eyes or behind them gives no usable direction: aim along the camera
+	idVec3 dir = aimPoint - eye;
+	if ( dir * viewAxis[0] < ACTION_AIM_MIN_DIST ) {
+		dir = viewAxis[0];
+	}
+	dir.Normalize();
+
+	actionAimDir = dir;
+	aimAngles = ( dir * physicsObj.GetGravityAxis().Transpose() ).ToAngles();
+	aimAngles.roll = 0.0f;
+	aimAngles.Normalize180();
+
+	// where a shot really lands: from the eyes, something close to the player (a corner, a pillar) can
+	// block the aim before the point under the center of the screen. The crosshair is drawn there
+	trace_t tr;
+	gameLocal.clip.TracePoint( tr, eye, eye + dir * ACTION_AIM_DISTANCE, MASK_SHOT_RENDERMODEL, this );
+	actionAimPoint = tr.endpos;
+	actionAimHit = tr.fraction < 1.0f && ( tr.endpos - eye ).LengthSqr() < Square( ACTION_CROSSHAIR_MAX_DIST );
 }
 
 /*
@@ -5751,6 +6026,38 @@ void idPlayer::UseVehicle( void ) {
 
 /*
 ==============
+idPlayer::UseItem
+
+  Picks up the item under the crosshair, if any.
+==============
+*/
+bool idPlayer::UseItem( void ) {
+	const float maxRange = 128.0f;
+	trace_t	trace;
+	idVec3 start, end;
+	idEntity *ent;
+
+	start = GetEyePosition();
+	end = start + viewAngles.ToForward() * maxRange;
+	gameLocal.clip.TracePoint( trace, start, end, MASK_SHOT_RENDERMODEL, this );
+	if ( trace.fraction >= 1.0f ) {
+		return false;
+	}
+
+	ent = gameLocal.entities[ trace.c.entityNum ];
+	if ( !ent || !ent->IsType( idItem::Type ) ) {
+		return false;
+	}
+
+	idItem *item = static_cast<idItem *>( ent );
+	if ( !item->CanBeUsedBy( this, trace.fraction * maxRange ) ) {
+		return false;
+	}
+	return item->Use( this );
+}
+
+/*
+==============
 idPlayer::PerformImpulse
 ==============
 */
@@ -5831,8 +6138,14 @@ void idPlayer::PerformImpulse( int impulse ) {
 			}
 			break;
 		}
+		case IMPULSE_24: {
+			ToggleLockOn();
+			break;
+		}
 		case IMPULSE_40: {
-			UseVehicle();
+			if ( !UseItem() ) {
+				UseVehicle();
+			}
 			break;
 		}
 	}
@@ -6010,7 +6323,7 @@ void idPlayer::UpdateLean( int msec ) {
 	buttons = usercmd.buttons & ( BUTTON_LEAN_LEFT | BUTTON_LEAN_RIGHT );
 
 	if ( health <= 0 || spectating || noclip || physicsObj.OnLadder() || IsSprinting() || IsSliding() || IsVaulting() ||
-		gameLocal.inCinematic || objectiveSystemOpen || influenceActive ) {
+		gameLocal.inCinematic || objectiveSystemOpen || influenceActive || actionCameraActive ) {
 		currentLean = LEAN_NONE;
 	} else if ( buttons == BUTTON_LEAN_LEFT ) {
 		currentLean = LEAN_LEFT;
@@ -6751,7 +7064,7 @@ void idPlayer::UpdateVaultView( int msec ) {
 
 	// ledge grab: turn the view a few degrees to face the wall during phase 1. This changes the real
 	// view angles (through the delta angles) so the correction stays after the vault
-	if ( state == VAULT_HIGH_GRAB || state == VAULT_CLIMBING ) {
+	if ( !actionCameraActive && ( state == VAULT_HIGH_GRAB || state == VAULT_CLIMBING ) ) {
 		if ( !vaultYawStarted ) {
 			vaultYawStarted = true;
 			const float wallYaw = ( -physicsObj.GetVaultLedgeNormal() ).ToYaw();
@@ -6804,7 +7117,11 @@ void idPlayer::AdjustBodyAngles( void ) {
 
 	blend = true;
 
-	if ( !physicsObj.HasGroundContacts() ) {
+	if ( actionCameraActive ) {
+		// the whole body turns towards the movement (UpdateBodyYaw), the legs never twist against it
+		idealLegsYaw = 0.0f;
+		legsForward = true;
+	} else if ( !physicsObj.HasGroundContacts() ) {
 		idealLegsYaw = 0.0f;
 		legsForward = true;
 	} else if ( usercmd.forwardmove < 0 ) {
@@ -6857,7 +7174,16 @@ void idPlayer::AdjustBodyAngles( void ) {
 	animator.SetJointAxis( hipJoint, JOINTMOD_WORLD, legsAxis );
 
 	// calculate the blending between down, straight, and up
-	frac = viewAngles.pitch / 90.0f;
+	float pitch = viewAngles.pitch;
+	if ( actionCameraActive ) {
+		// viewAngles is level with the action camera: the torso follows the aim pitch in combat stance only,
+		// limited so the skeleton doesn't break, and eased so entering / leaving the stance doesn't pop
+		const float wantedPitch = IsActionAiming() ? idMath::ClampFloat( -ACTION_TORSO_PITCH_LIMIT, ACTION_TORSO_PITCH_LIMIT, aimAngles.pitch ) : 0.0f;
+		const float step = ACTION_TORSO_PITCH_SPEED * MS2SEC( gameLocal.msec );
+		actionTorsoPitch += idMath::ClampFloat( -step, step, wantedPitch - actionTorsoPitch );
+		pitch = actionTorsoPitch;
+	}
+	frac = pitch / 90.0f;
 	if ( frac > 0.0f ) {
 		downBlend		= frac;
 		forwardBlend	= 1.0f - frac;
@@ -7320,6 +7646,9 @@ void idPlayer::Think( void ) {
 
 	Move();
 
+	// action camera: turn the model towards where it moves
+	UpdateBodyYaw();
+
 	if ( !g_stopTime.GetBool() ) {
 
 		if ( !noclip && !spectating && ( health > 0 ) && !IsHidden() ) {
@@ -7368,11 +7697,12 @@ void idPlayer::Think( void ) {
 	// position the view weapon, among other things
 	CalculateFirstPersonView();
 
-	// blink aiming traces from the final camera of this frame
-	UpdateBlink();
-
-	// this may use firstPersonView, or a thirdPeroson / camera view
+	// this may use firstPersonView, or a thirdPeroson / camera view. The action camera also
+	// rebuilds firstPersonView here, aimed at the center of the screen
 	CalculateRenderView();
+
+	// blink aiming traces from the final first person view of this frame
+	UpdateBlink();
 
 	inventory.UpdateArmor();
 
@@ -7940,6 +8270,7 @@ void idPlayer::Teleport( const idVec3 &origin, const idAngles &angles, idEntity 
 	GetPhysics()->SetLinearVelocity( vec3_origin );
 
 	SetViewAngles( angles );
+	thirdPersonCam.Reset();
 
 	legsYaw = 0.0f;
 	idealLegsYaw = 0.0f;
@@ -8304,7 +8635,8 @@ void idPlayer::GetViewPos( idVec3 &origin, idMat3 &axis ) const {
 		origin = GetEyePosition();
 	} else {
 		origin = GetEyePosition() + viewBob;
-		angles = viewAngles + viewBobAngles + playerView.AngleOffset();
+		// the action camera aims the eyes at the center of the screen, viewAngles is only the movement heading there
+		angles = ( actionCameraActive ? aimAngles : viewAngles ) + viewBobAngles + playerView.AngleOffset();
 
 		// lean offset and head roll
 		playerView.CalculatePlayerView( origin, angles );
@@ -8384,7 +8716,7 @@ void idPlayer::UpdateOffHandTransform( void ) {
 	}
 
 	// hidden whenever there's no first person view to attach to
-	if ( spectating || health <= 0 || gameLocal.inCinematic || pm_thirdPerson.GetBool() ) {
+	if ( spectating || health <= 0 || gameLocal.inCinematic || pm_thirdPerson.GetBool() || actionCameraActive ) {
 		if ( !model->IsHidden() ) {
 			model->Hide();
 		}
@@ -8506,7 +8838,13 @@ void idPlayer::CalculateRenderView( void ) {
 			gameLocal.GetCamera()->GetViewParms( renderView );
 		}
 	} else {
-		if ( g_stopTime.GetBool() ) {
+		if ( actionCameraActive ) {
+			// orbit camera, then aim the eyes at what ended up in the center of the screen and rebuild
+			// the first person view (weapons, blink, use) along that aim
+			thirdPersonCam.Update( this, renderView );
+			UpdateActionAim( renderView->vieworg, renderView->viewaxis );
+			CalculateFirstPersonView();
+		} else if ( g_stopTime.GetBool() ) {
 			renderView->vieworg = firstPersonViewOrigin;
 			renderView->viewaxis = firstPersonViewAxis;
 
@@ -9018,6 +9356,8 @@ void idPlayer::ClientPredictionThink( void ) {
 		// don't allow client to move when lagged
 		Move();
 	}
+
+	UpdateBodyYaw();
 
 	// update GUIs, Items, and character interactions
 	UpdateFocus();
