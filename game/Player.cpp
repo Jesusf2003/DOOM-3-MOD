@@ -4109,6 +4109,10 @@ void idPlayer::Weapon_Combat( void ) {
 		}
 	}
 
+	// aim down sights: right click with anything but the flashlight, which uses it for the blink
+	weapon.GetEntity()->SetAiming( !influenceActive && !weaponGone && ( usercmd.buttons & BUTTON_AIM ) &&
+		currentWeapon != weapon_flashlight );
+
 	// update our ammo clip in our inventory
 	if ( ( currentWeapon >= 0 ) && ( currentWeapon < MAX_WEAPONS ) ) {
 		inventory.clip[ currentWeapon ] = weapon.GetEntity()->AmmoInClip();

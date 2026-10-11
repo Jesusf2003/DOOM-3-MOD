@@ -109,6 +109,7 @@ public:
 	void					OwnerDied( void );
 	void					BeginAttack( void );
 	void					EndAttack( void );
+	void					SetAiming( bool aim );
 	bool					IsReady( void ) const;
 	bool					IsReloading( void ) const;
 	bool					IsHolstered( void ) const;
@@ -121,6 +122,7 @@ public:
 	virtual idThread *		ConstructScriptObject( void );
 	virtual void			DeconstructScriptObject( void );
 	void					SetState( const char *statename, int blendFrames );
+	void					LinkScriptVariables( void );
 	void					UpdateScript( void );
 	void					EnterCinematic( void );
 	void					ExitCinematic( void );
@@ -167,6 +169,7 @@ private:
 	idScriptBool			WEAPON_NETFIRING;
 	idScriptBool			WEAPON_RAISEWEAPON;
 	idScriptBool			WEAPON_LOWERWEAPON;
+	idScriptBool			WEAPON_AIM;			// optional: only linked when the weapon script declares it
 	weaponStatus_t			status;
 	idThread *				thread;
 	idStr					state;

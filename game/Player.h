@@ -117,6 +117,8 @@ const float OFFHAND_VIEW_OFFSET_UP = -6.0f;		// along the view's up axis (axis[2
 
 // blink (prototype: aiming only), bound with "bind MOUSE2 _button7" (BUTTON_7 is the last free usercmd bit)
 const int BUTTON_BLINK = BUTTON_7;
+// the same button aims down the sights with any other weapon (WEAPON_AIM in the weapon script)
+const int BUTTON_AIM = BUTTON_7;
 const float BLINK_MAX_DISTANCE = 1200.0f;		// reach of the aiming trace
 const float BLINK_WALL_MAX_SLOPE = 0.3f;		// |normal . up| below this: a wall that may have a ledge on top
 const float BLINK_LEDGE_MIN_NORMAL = 0.7f;		// the top of the ledge must be walkable

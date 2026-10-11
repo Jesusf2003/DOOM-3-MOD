@@ -394,13 +394,7 @@ void idWeapon::Restore( idRestoreGame *savefile ) {
 	savefile->ReadBool( isLinked );
 
 	// Re-link script fields
-	WEAPON_ATTACK.LinkTo(		scriptObject, "WEAPON_ATTACK" );
-	WEAPON_RELOAD.LinkTo(		scriptObject, "WEAPON_RELOAD" );
-	WEAPON_NETRELOAD.LinkTo(	scriptObject, "WEAPON_NETRELOAD" );
-	WEAPON_NETENDRELOAD.LinkTo(	scriptObject, "WEAPON_NETENDRELOAD" );
-	WEAPON_NETFIRING.LinkTo(	scriptObject, "WEAPON_NETFIRING" );
-	WEAPON_RAISEWEAPON.LinkTo(	scriptObject, "WEAPON_RAISEWEAPON" );
-	WEAPON_LOWERWEAPON.LinkTo(	scriptObject, "WEAPON_LOWERWEAPON" );
+	LinkScriptVariables();
 
 	savefile->ReadObject( reinterpret_cast<idClass *&>( owner ) );
 	worldModel.Restore( savefile );
@@ -567,6 +561,7 @@ void idWeapon::Clear( void ) {
 	WEAPON_NETFIRING.Unlink();
 	WEAPON_RAISEWEAPON.Unlink();
 	WEAPON_LOWERWEAPON.Unlink();
+	WEAPON_AIM.Unlink();
 
 	if ( muzzleFlashHandle != -1 ) {
 		gameRenderWorld->FreeLightDef( muzzleFlashHandle );
@@ -1003,13 +998,7 @@ void idWeapon::GetWeaponDef( const char *objectname, int ammoinclip ) {
 		gameLocal.Error( "Script object '%s' not found on weapon '%s'.", objectType, objectname );
 	}
 
-	WEAPON_ATTACK.LinkTo(		scriptObject, "WEAPON_ATTACK" );
-	WEAPON_RELOAD.LinkTo(		scriptObject, "WEAPON_RELOAD" );
-	WEAPON_NETRELOAD.LinkTo(	scriptObject, "WEAPON_NETRELOAD" );
-	WEAPON_NETENDRELOAD.LinkTo(	scriptObject, "WEAPON_NETENDRELOAD" );
-	WEAPON_NETFIRING.LinkTo(	scriptObject, "WEAPON_NETFIRING" );
-	WEAPON_RAISEWEAPON.LinkTo(	scriptObject, "WEAPON_RAISEWEAPON" );
-	WEAPON_LOWERWEAPON.LinkTo(	scriptObject, "WEAPON_LOWERWEAPON" );
+	LinkScriptVariables();
 
 	spawnArgs = weaponDef->dict;
 
@@ -1445,6 +1434,20 @@ void idWeapon::EndAttack( void ) {
 
 /*
 ================
+idWeapon::SetAiming
+
+Aim down sights button state, read by the weapon script as WEAPON_AIM. Weapons whose script
+doesn't declare it ignore it.
+================
+*/
+void idWeapon::SetAiming( bool aim ) {
+	if ( WEAPON_AIM.IsLinked() ) {
+		WEAPON_AIM = aim;
+	}
+}
+
+/*
+================
 idWeapon::isReady
 ================
 */
@@ -1543,6 +1546,28 @@ idEntity * idWeapon::DropItem( const idVec3 &velocity, int activateDelay, int re
 	Script state management
 
 ***********************************************************************/
+
+/*
+================
+idWeapon::LinkScriptVariables
+
+WEAPON_AIM is optional so the stock weapon scripts, which don't declare it, still load.
+================
+*/
+void idWeapon::LinkScriptVariables( void ) {
+	WEAPON_ATTACK.LinkTo(		scriptObject, "WEAPON_ATTACK" );
+	WEAPON_RELOAD.LinkTo(		scriptObject, "WEAPON_RELOAD" );
+	WEAPON_NETRELOAD.LinkTo(	scriptObject, "WEAPON_NETRELOAD" );
+	WEAPON_NETENDRELOAD.LinkTo(	scriptObject, "WEAPON_NETENDRELOAD" );
+	WEAPON_NETFIRING.LinkTo(	scriptObject, "WEAPON_NETFIRING" );
+	WEAPON_RAISEWEAPON.LinkTo(	scriptObject, "WEAPON_RAISEWEAPON" );
+	WEAPON_LOWERWEAPON.LinkTo(	scriptObject, "WEAPON_LOWERWEAPON" );
+	if ( scriptObject.GetVariable( "WEAPON_AIM", ev_boolean ) ) {
+		WEAPON_AIM.LinkTo(		scriptObject, "WEAPON_AIM" );
+	} else {
+		WEAPON_AIM.Unlink();
+	}
+}
 
 /*
 =====================
@@ -2034,6 +2059,7 @@ void idWeapon::EnterCinematic( void ) {
 		WEAPON_NETFIRING	= false;
 		WEAPON_RAISEWEAPON	= false;
 		WEAPON_LOWERWEAPON	= false;
+		SetAiming( false );
 	}
 
 	disabled = true;
